@@ -1,0 +1,72 @@
+# ===================================================================
+# PhishAware - Git Ignore Kuralları
+# ===================================================================
+
+# --- Güvenlik & Gizli Veriler (Secrets, Credentials, Tokens) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.p12
+
+# --- Canlı Veritabanı ve Yerel Çalışma Dosyaları ---
+*.db
+*.sqlite
+*.sqlite3
+phishaware.db
+
+# --- Python Derleme & Önbellek Dosyaları ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Sanal Ortamlar (Virtual Environments) ---
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Test, Kapsam ve IDE Araçları ---
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- İşletim Sistemi Kalıntıları ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Yerel Sohbet, Rapor ve Geçici Dosyalar ---
+scratch/
+*Sohbet_Gecmisi*
+*.tmp
+*.log
+.agents/
+eval.md
+no_ai_slop_skill_raw.md
