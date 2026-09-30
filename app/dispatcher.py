@@ -161,7 +161,7 @@ def gercek_smtp_mail_gonder(
     if not user or not password:
         return {
             "durum": "simule",
-            "mesaj": "Gerçek SMTP kimlik bilgisi (kullanıcı ve şifre) tanımlanmadığı için e-posta güvenli 'Simüle Cloud Mail Relay' üzerinden iletildi olarak işaretlendi. E-postanın mertcinbar@posta.mu.edu.tr gelen kutusuna (inbox) gerçekten düşmesi için modal içerisindeki '⚙️ Canlı SMTP Gönderici Ayarları' alanına geçerli bir Gmail veya kurumsal posta hesabı girebilirsiniz.",
+            "mesaj": "Gerçek SMTP kimlik bilgisi (kullanıcı ve şifre) tanımlanmadığı için e-posta güvenli 'Simüle Cloud Mail Relay' üzerinden iletildi olarak işaretlendi. E-postanın alıcı gelen kutusuna (inbox) gerçekten düşmesi için modal içerisindeki '⚙️ Canlı SMTP Gönderici Ayarları' alanına geçerli bir Gmail veya kurumsal posta hesabı girebilirsiniz.",
             "alici": alici_email
         }
 
