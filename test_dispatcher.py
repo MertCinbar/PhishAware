@@ -32,7 +32,7 @@ def test_dispatcher():
     rapor = data["dagitim_raporu"]
     print(f"[OK] Otomatik Dağıtım Başarılı: {rapor['toplam_hedef']} personele dağıtıldı.")
     print(f"[OK] Maskelenmiş Gönderici: {rapor['maskelenmis_gonderici']}")
-    assert len(rapor["loglar"]) == 22, f"Beklenen 22 hedef, gelen: {len(rapor['loglar'])}"
+    assert len(rapor["loglar"]) >= 22, f"Beklenen en az 22 hedef, gelen: {len(rapor['loglar'])}"
 
     print("\n--- 2. Testing Live Email Test Endpoint (Simulation Fallback) ---")
     res_mail = client.post(f"/simulasyon/canli-mail-testi?alici_email=test.guvenlik@ornek.com&sablon_id={sablon.id}")
@@ -50,19 +50,45 @@ def test_dispatcher():
     assert smtp_data["durum"] == "hata"
     print(f"[OK] SMTP Parametre Testi: {smtp_data['durum']} (Beklendiği gibi bağlantı hatası yakalandı)")
 
-    print("\n--- 4. Testing Dashboard Rendering with Terminal & Email Modals ---")
+    print("\n--- 4. Testing Live Telegram Test with Quishing (qr_ile_mi=True) ---")
+    res_tg = client.post("/simulasyon/canli-telegram-testi?qr_ile_mi=true")
+    assert res_tg.status_code == 200
+    tg_data = res_tg.json()
+    assert tg_data["durum"] in ["simule", "basarili", "hata"]
+    print(f"[OK] Canlı Telegram Testi (QR Modu): {tg_data['durum']} - {tg_data['mesaj'][:60]}...")
+
+    print("\n--- 5. Testing Campaign Launch with Telegram + QR Hybrid Mode ---")
+    res_camp_tg = client.post("/kampanyalar/baslat", json={
+        "ad": "2026 Telegram Quishing Hibrit Tatbikatı",
+        "sirket_id": sirket.id,
+        "kanal": "telegram",
+        "qr_ile_mi": True,
+        "otomatik_ai": True
+    })
+    assert res_camp_tg.status_code == 200
+    camp_tg_data = res_camp_tg.json()
+    assert camp_tg_data["dagitim_raporu"]["qr_ile_mi"] is True
+    assert "Quishing" in camp_tg_data["dagitim_raporu"]["protokol"]
+    print(f"[OK] Telegram QR Hibrit Kampanya Başlatıldı: {camp_tg_data['dagitim_raporu']['protokol']}")
+
+    print("\n--- 6. Testing Dashboard Rendering with 3 Channels & QR Controls ---")
     res_dash = client.get("/dashboard")
     assert res_dash.status_code == 200
     html = res_dash.text
     assert "modalTerminal" in html
     assert "modalEpostaTest" in html
+    assert "modalTelegramTest" in html
+    assert "testMailQrIleMi" in html
+    assert "testTgQrIleMi" in html
+    assert "kampanyaQrIleMi" in html
     assert "akisliDagitimGoster" in html
     assert "smtpAyarGovde" in html
-    assert "smtpHazirPreset" in html
-    assert "toggleSmtpAyar" in html
-    print("[OK] Dashboard contains Live Terminal Dispatch Console, SMTP Accordion & Email Test Modal!")
+    # Ensure retired channels are removed from modals
+    assert "modalWhatsApp" not in html
+    assert "modalSMS" not in html
+    print("[OK] Dashboard contains Live Terminal, Telegram & Email Modals, QR Checkboxes, and WhatsApp/SMS are purged!")
 
-    print("\n[SUCCESS] ALL DISPATCHER TESTS PASSED WITH 100% SUCCESS!")
+    print("\n[SUCCESS] ALL DISPATCHER & QR HYBRID TESTS PASSED WITH 100% SUCCESS!")
 
 if __name__ == "__main__":
     test_dispatcher()

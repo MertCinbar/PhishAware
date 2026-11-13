@@ -20,12 +20,13 @@ print(f"Dağıtılan toplam log sayısı: {len(loglar1)}")
 for l in loglar1[:7]:
     print(f" - [{l['sira']}] {l['calisan_adi']} ({l['departman']}) -> {l['sablon_adi']}")
 
-print("\n--- TEST 2: Tek Departman Hedefleme: Sadece 'Bilgi İşlem (IT)' ---")
+print("\n--- TEST 2: Tek Departman Hedefleme: Sadece 'Bilgi İşlem (IT)' (Telegram + QR Hibrit) ---")
 payload_it = {
-    "ad": "2026 IT WhatsApp Siber Güvenlik Tatbikatı",
+    "ad": "2026 IT Telegram Quishing Hibrit Tatbikatı",
     "sirket_id": 1,
     "hedef_departman": "Bilgi İşlem (IT)",
-    "kanal": "whatsapp",
+    "kanal": "telegram",
+    "qr_ile_mi": True,
     "otomatik_ai": True
 }
 r2 = requests.post(f"{BASE}/kampanyalar/baslat", json=payload_it)
@@ -34,14 +35,14 @@ d2 = r2.json()
 print("Toplam Hedef IT Çalışanı:", d2.get("toplam_hedef_calisan"))
 loglar2 = d2.get("dagitim_raporu", {}).get("loglar", [])
 for l in loglar2:
-    print(f" - [{l['sira']}] {l['calisan_adi']} ({l['departman']}) -> {l['sablon_adi']} (Kanal: {l['kanal']})")
+    print(f" - [{l['sira']}] {l['calisan_adi']} ({l['departman']}) -> {l['sablon_adi']} (Kanal: {l['kanal']}, QR: {l.get('qr_ile_mi')})")
 
-print("\n--- TEST 3: Tek Departman Hedefleme: Sadece 'İnsan Kaynakları (İK)' ---")
+print("\n--- TEST 3: Tek Departman Hedefleme: Sadece 'İnsan Kaynakları (İK)' (Fiziksel QR Afişi) ---")
 payload_ik = {
-    "ad": "2026 İK Özel SMS Tatbikatı",
+    "ad": "2026 İK QR Quishing Panosu Tatbikatı",
     "sirket_id": 1,
     "hedef_departman": "İnsan Kaynakları (İK)",
-    "kanal": "sms",
+    "kanal": "qr",
     "otomatik_ai": True
 }
 r3 = requests.post(f"{BASE}/kampanyalar/baslat", json=payload_ik)
@@ -59,4 +60,9 @@ assert "phishaware_theme') || 'classic'" in r4.text, "Varsayılan tema classic o
 assert "🛡️" in r4.text, "Logo kalkan emojisi olmalı!"
 assert "hedefDepartman" in r4.text, "Hedef departman seçicisi mevcut olmalı!"
 assert "Atanan Oltalama Senaryosu" in r4.text, "Tabloda Atanan Senaryo sütunu mevcut olmalı!"
+assert "kampanyaQrIleMi" in r4.text, "Kampanya formunda QR hibrit seçeneği olmalı!"
+assert "testMailQrIleMi" in r4.text, "Mail test modalında QR onay kutusu olmalı!"
+assert "testTgQrIleMi" in r4.text, "Telegram test modalında QR onay kutusu olmalı!"
+assert "modalWhatsApp" not in r4.text, "WhatsApp modalı temizlenmiş olmalı!"
+assert "modalSMS" not in r4.text, "SMS modalı temizlenmiş olmalı!"
 print("Tüm doğrulamalar başarıyla geçti!")

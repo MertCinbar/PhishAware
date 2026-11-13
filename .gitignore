@@ -70,3 +70,4 @@ scratch/
 .agents/
 eval.md
 no_ai_slop_skill_raw.md
+check_tg.py

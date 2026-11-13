@@ -24,6 +24,8 @@ class Calisan(Base):
     ad_soyad = Column(String(100), nullable=False)
     email = Column(String(150), nullable=False, index=True)
     departman = Column(String(50), nullable=False)
+    telefon = Column(String(30), nullable=True, default="")
+    telegram_id = Column(String(50), nullable=True, default="")
     risk_puani = Column(Integer, default=0)
 
     sirket = relationship("Sirket", back_populates="calisanlar")

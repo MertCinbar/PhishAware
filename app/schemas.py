@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -6,21 +6,19 @@ class SirketOlustur(BaseModel):
     ad: str = Field(default="TrendLojistik A.Ş.", description="Şirketin adı")
     sektor: str = Field(default="E-Ticaret ve Lojistik", description="Faaliyet sektörü")
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "ad": "TrendLojistik A.Ş.",
                 "sektor": "E-Ticaret ve Lojistik"
             }
         }
-    }
+    )
 
 class SirketCevap(SirketOlustur):
     id: int
     olusturuldugu_tarih: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class CalisanOlustur(BaseModel):
@@ -28,9 +26,12 @@ class CalisanOlustur(BaseModel):
     ad_soyad: str = Field(default="Zeynep Kaya", description="Çalışanın adı soyadı")
     email: str = Field(default="zeynep@trendlojistik.com", description="E-posta adresi")
     departman: str = Field(default="Pazarlama", description="Çalıştığı departman")
+    telefon: Optional[str] = Field(default="", description="Telefon numarası")
+    telegram_id: Optional[str] = Field(default="", description="Telegram Chat ID veya kullanıcı adı")
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "sirket_id": 1,
                 "ad_soyad": "Zeynep Kaya",
@@ -38,14 +39,11 @@ class CalisanOlustur(BaseModel):
                 "departman": "Pazarlama"
             }
         }
-    }
+    )
 
 class CalisanCevap(CalisanOlustur):
     id: int
     risk_puani: int
-
-    class Config:
-        from_attributes = True
 
 
 class SablonOlustur(BaseModel):
@@ -54,10 +52,11 @@ class SablonOlustur(BaseModel):
     gonderen_adi: str = Field(default="Hızlı Kargo Müşteri Hizmetleri", description="Görünen gönderici adı")
     icerik_html: str = Field(default="<p>Paketiniz şubede bekliyor. Güncellemek için: <a href='{{LINK}}'>Tıklayın</a></p>", description="E-posta HTML içeriği")
     yapay_zeka_ile_mi: bool = False
-    kanal: str = Field(default="email", description="Oltalama iletim kanalı: email, sms, whatsapp, qr")
+    kanal: str = Field(default="email", description="Oltalama iletim kanalı: email, telegram, qr")
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "baslik": "Acil Kargo İade Bildirimi",
                 "konu": "[ÖNEMLİ] Gönderiniz teslim edilemedi!",
@@ -67,13 +66,10 @@ class SablonOlustur(BaseModel):
                 "kanal": "email"
             }
         }
-    }
+    )
 
 class SablonCevap(SablonOlustur):
     id: int
-
-    class Config:
-        from_attributes = True
 
 
 class KampanyaOlustur(BaseModel):
@@ -81,29 +77,29 @@ class KampanyaOlustur(BaseModel):
     sablon_id: Optional[int] = Field(default=1, description="Kullanılacak şablon ID")
     ad: str = Field(default="2026 Güz Dönemi İlk Oltalama Tatbikatı", description="Kampanyaya verilecek isim")
     hedef_departman: Optional[str] = Field(default="hepsi", description="hepsi veya hedef departman")
-    kanal: Optional[str] = Field(default="email", description="email, whatsapp, sms, qr")
+    kanal: Optional[str] = Field(default="email", description="email, telegram, qr")
     otomatik_ai: Optional[bool] = Field(default=True, description="Departmana özel otonom AI senaryosu eşle")
+    qr_ile_mi: Optional[bool] = Field(default=False, description="E-posta veya Telegram içine taranabilir QR Kod görseli ekle (Quishing Modu)")
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "sirket_id": 1,
                 "sablon_id": 1,
                 "ad": "2026 Güz Dönemi İlk Oltalama Tatbikatı",
                 "hedef_departman": "hepsi",
                 "kanal": "email",
-                "otomatik_ai": True
+                "otomatik_ai": True,
+                "qr_ile_mi": False
             }
         }
-    }
+    )
 
 class KampanyaCevap(KampanyaOlustur):
     id: int
     durum: str
     olusturuldugu_tarih: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class SimulasyonLogDetay(BaseModel):
@@ -134,15 +130,16 @@ class AISablonIstek(BaseModel):
     sektor: str = Field(default="Finans ve Bankacılık", description="Şirketin faaliyet sektörü")
     departman: str = Field(default="Muhasebe", description="Hedef çalışan departmanı")
     zorluk: str = Field(default="orta", description="kolay, orta veya zor")
-    kanal: str = Field(default="email", description="email, sms, whatsapp, qr")
+    kanal: str = Field(default="email", description="email, telegram, qr")
 
-    model_config = {
-        "json_schema_extra": {
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
             "example": {
                 "sektor": "Finans ve Bankacılık",
                 "departman": "Muhasebe",
                 "zorluk": "orta",
-                "kanal": "whatsapp"
+                "kanal": "telegram"
             }
         }
-    }
+    )

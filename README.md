@@ -17,9 +17,11 @@ Dünyadaki siber saldırıların **%91'inden fazlası** doğrudan sistem açıkl
 ### 🌟 Öne Çıkan Yetenekler
 
 - **Çok Kanallı (Omnichannel) Tatbikat Desteği:**
-  - ✉️ **E-Posta (Spear Phishing):** Departmana özel hazırlanmış maskelenmiş kurumsal e-postalar.
-  - 💬 **WhatsApp & SMS (Smishing):** Mobil çalışanları hedefleyen fatura, kargo veya hesap doğrulama senaryoları.
+  - ✉️ **E-Posta (Spear Phishing):** Departmana özel hazırlanmış maskelenmiş kurumsal e-postalar ve gömülü QR kartları.
+  - 🤖 **Telegram Bot & Mobil Bildirim:** `@trend_guvenlik_mert_bot` üzerinden anlık oltalama mesajları ve taranabilir karekod fotoğrafları.
   - 📱 **Dinamik QR Kod (Quishing):** Dinamik QR kodları ile fiziksel ve dijital tarama testleri.
+- **🎮 3D Sanal Ofis Siber Farkındalık Oyunu (`/oyun-simulasyonu`):**
+  - Tuzağa düşen çalışanlar sıkıcı metinler yerine 1. Şahıs (FPS) ve 3D İzometrik kameralı sanal ofis simülasyonunda 3 departman masasını (Muhasebe, İK, IT/SOC) inceleyerek interaktif eğitim alır (HTML5 Canvas 3D + Web Audio API + Unity WebGL köprüsü).
 - **Departman Bazlı Akıllı Yapay Zeka Eşleme (%20 YZ / %80 Mühendislik):**
   - Tek tıkla ister tüm şirkete, ister belirli bir birime (IT, İK, Finans, Satış vb.) uygun senaryolar atanır.
   - IT personeline SSH/yama uyarısı, İK personeline bordro/yan haklar, Finans birimine IBAN/fatura iptali senaryosu otomatik üretilir.
@@ -153,7 +155,8 @@ Platform ayağa kalktığında tarayıcınızdan aşağıdaki web arayüzlerine 
 | URL / Endpoint | Web Bileşeni | Açıklama ve Özellikler |
 | :--- | :--- | :--- |
 | **[`/dashboard`](http://127.0.0.1:8000/dashboard)** | 🛡️ **Yönetim & Komuta Masası** | Canlı yanıp sönen radar rozeti, KPI kartları, departman risk çubukları, tek tıkla tatbikat başlatma formu, gerçek zamanlı siber terminal ve aktif hedef takip tablosu. |
-| **[`/tikla/{token}`](http://127.0.0.1:8000/docs)** | ⚠️ **İhlal & Anında Eğitim Sayfası** | Oltalamaya tıklayan personele özel üretilen eğitim landing page'i. Hangi ipuçlarını kaçırdığını gösterir, virüs bulaştırmadan farkındalık aşılar. |
+| **[`/oyun-simulasyonu`](http://127.0.0.1:8000/oyun-simulasyonu)** | 🎮 **3D Sanal Ofis Eğitim Simülasyonu** | 1. Şahıs (FPS) ve 3D İzometrik bakış açılı sanal ofiste WASD ve fare ile gezerek Muhasebe, İK ve IT masalarındaki oltalama vakalarını inceleme oyunu. |
+| **[`/tikla/{token}`](http://127.0.0.1:8000/docs)** | ⚠️ **İhlal & Anında Eğitim Sayfası** | Oltalamaya tıklayan personele özel üretilen eğitim landing page'i ve entegre 3D sanal ofis tatbikatı. |
 | **[`/ihbar/{token}`](http://127.0.0.1:8000/docs)** | 🏆 **Siber Kahraman (PhishAlert) Ekranı** | Şüpheli mesajı fark edip bildiren personele ödül tebriki sunar ve sistemdeki risk puanını 5 puan düşürür. |
 | **[`/rapor/csv/{sirket_id}`](http://127.0.0.1:8000/rapor/csv/1)** | 📥 **Resmi Denetim Raporu İndirme** | KVKK ve ISO 27001 uyumlu, UTF-8 BOM destekli Excel uyumlu Türkçe CSV denetim raporu çıktısı. |
 | **[`/docs`](http://127.0.0.1:8000/docs)** | 📑 **Interactive Swagger UI** | Tüm backend API rotalarının parametrelerini test edebileceğiniz interaktif dokümantasyon. |

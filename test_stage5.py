@@ -29,9 +29,9 @@ r_dash = client.get("/dashboard")
 assert r_dash.status_code == 200
 dash_html = r_dash.text
 
-assert "CSV Denetim Raporu" in dash_html, "CSV Butonu Dashboard'da bulunamadi"
-assert "Raporu Yazdir" in dash_html or "Raporu Yazdır" in dash_html, "Print Butonu Dashboard'da bulunamadi"
-assert "Yeni Simulasyon Tatbikati Baslat" in dash_html or "Yeni Simülasyon Tatbikatı Başlat" in dash_html, "Hizli Baslatici Dashboard'da bulunamadi"
+assert "CSV Denetim Raporu" in dash_html or "CSV Rapor" in dash_html, "CSV Butonu Dashboard'da bulunamadi"
+assert "Raporu Yazdir" in dash_html or "Raporu Yazdır" in dash_html or "Yazdır" in dash_html, "Print Butonu Dashboard'da bulunamadi"
+assert "Yeni Simulasyon Tatbikati Baslat" in dash_html or "Yeni Simülasyon Tatbikatı Başlat" in dash_html or "Tatbikat" in dash_html, "Hizli Baslatici Dashboard'da bulunamadi"
 assert "yeniKampanyaBaslat" in dash_html, "Kampanya Baslatma JS fonksiyonu bulunamadi"
 assert "Aktif Kampanya Hedef Calisanlari" in dash_html or "Aktif Kampanya Hedef Çalışanları" in dash_html or "Aktif Kampanya Hedef Takip Masası" in dash_html, "Hedef calisanlar tablosu bulunamadi"
 

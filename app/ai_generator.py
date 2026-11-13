@@ -15,13 +15,19 @@ def _api_anahtarini_al():
                         break
     return key
 
+import time
+
+_gemini_devre_disi_zamani = 0
+
 def senaryo_uret(sektor: str, departman: str, zorluk: str = "orta", kanal: str = "email") -> dict:
+    global _gemini_devre_disi_zamani
     api_key = _api_anahtarini_al()
 
     kanal_aciklama = {
         "email": "Kurumsal E-posta formatında profesyonel oltalama e-postası",
         "sms": "160 karakteri geçmeyen, acil işlem gerektiren sahte kurumsal SMS (Smishing) metni",
         "whatsapp": "Kurumsal WhatsApp onay mesajı (emojiler, resmi şirket bildirimi ve ek doğrulama bağlantısı içeren)",
+        "telegram": "Resmi şirket güvenlik hattından gelen acil işlem bildirimi (Telegram Inline Buton ve doğrulama bağlantısı içeren)",
         "qr": "Ofis veya şirket içi panoya asılacak merak uyandırıcı QR Kod Oltalama (Quishing) afiş metni"
     }.get(kanal, "Kurumsal E-posta")
 
@@ -52,7 +58,7 @@ def senaryo_uret(sektor: str, departman: str, zorluk: str = "orta", kanal: str =
     }}
     """
 
-    if api_key:
+    if api_key and time.time() > _gemini_devre_disi_zamani:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={api_key}"
             headers = {"Content-Type": "application/json"}
@@ -63,7 +69,7 @@ def senaryo_uret(sektor: str, departman: str, zorluk: str = "orta", kanal: str =
                     "responseMimeType": "application/json"
                 }
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=12)
+            resp = requests.post(url, headers=headers, json=payload, timeout=3)
             if resp.status_code == 200:
                 raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                 clean_json = raw_text.strip()
@@ -72,7 +78,10 @@ def senaryo_uret(sektor: str, departman: str, zorluk: str = "orta", kanal: str =
                 if clean_json.endswith("```"):
                     clean_json = clean_json[:-3]
                 return json.loads(clean_json.strip())
+            else:
+                _gemini_devre_disi_zamani = time.time() + 120
         except Exception as e:
+            _gemini_devre_disi_zamani = time.time() + 120
             print(f"[Yapay Zeka API Uyarısı]: Gemini API hatası ({e}), yerel yedek motor devrede.")
 
     return _yerel_yedek_senaryo(sektor, departman, kanal)
@@ -117,7 +126,7 @@ def risk_analizi_yorumu(departman_verileri: list) -> dict:
                     "responseMimeType": "application/json"
                 }
             }
-            resp = requests.post(url, headers=headers, json=payload, timeout=12)
+            resp = requests.post(url, headers=headers, json=payload, timeout=3.5)
             if resp.status_code == 200:
                 raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
                 clean_json = raw_text.strip()
@@ -128,6 +137,18 @@ def risk_analizi_yorumu(departman_verileri: list) -> dict:
                 return json.loads(clean_json.strip())
         except Exception as e:
             print(f"[AI Risk Analizi Uyarısı]: Gemini API çağrısı sırasında hata ({e}), yerel analiz devrede.")
+
+    toplam_tiklayan = sum(d.get("tiklayan", 0) for d in departman_verileri) if departman_verileri else 0
+    if toplam_tiklayan == 0:
+        return {
+            "en_riskli_departman": "Henüz Zaafiyet Yok (Güvenli)",
+            "genel_degerlendirme": "Aktif tatbikatta henüz herhangi bir personel oltalama tuzağına düşmedi veya tatbikat yeni başlatıldı. Tüm çalışanlar güvende ve tetikte.",
+            "aksiyon_onerileri": [
+                "Tatbikat dağıtımının ardından çalışanların tepkilerini Aktif Hedef Masası'ndan canlı izleyiniz.",
+                "Bağlantıyı açan veya parola giren personeller anlık olarak sisteme işlenecek ve mikro eğitim modülüne aktarılacaktır.",
+                "Şüpheli bağlantıyı fark edip ihbarda bulunan personeller 'Siber Kahraman' statüsü ile ödüllendirilecektir."
+            ]
+        }
 
     en_riskli = max(departman_verileri, key=lambda x: x["oran"]) if departman_verileri else {"departman": "Belirsiz", "oran": 0}
     return {
@@ -794,6 +815,27 @@ def _yerel_yedek_senaryo(sektor: str, departman: str, kanal: str = "email") -> d
                 """,
                 "ipuclari": [
                     "Kurumsal ağlara bağlanırken QR kod yerine resmi yönergeler izlenmelidir."
+                ]
+            }
+        elif kanal == "telegram":
+            return {
+                "baslik": f"Telegram - {departman} Acil Güvenlik Onayı & Şüpheli Oturum Uyarısı",
+                "konu": "✈️ TrendLojistik Kurumsal Telegram Masası",
+                "gonderen_adi": "TrendLojistik Siber Güvenlik Masası (@trend_guvenlik_mert_bot)",
+                "icerik_html": f"""
+                <div style="background:#1e293b; color:#f8fafc; padding:20px; border-radius:12px; font-family:Arial, sans-serif; border:1px solid #38bdf8;">
+                    <div style="font-size:12px; color:#38bdf8; font-weight:bold; margin-bottom:8px;">🛡️ TRENDLOJİSTİK SİBER GÜVENLİK BİLDİRİMİ</div>
+                    <h3 style="color:#ffffff; margin-top:0;">⚠️ {departman} Hesabınız İçin Yeni Cihaz Girişi</h3>
+                    <p style="font-size:13px; color:#cbd5e1;">Hesabınıza şüpheli bir konumdan erişim sağlandı. İşlemi siz yapmadıysanız lütfen hemen oturumu kapatın ve kimliğinizi doğrulayın:</p>
+                    <div style="margin:20px 0;">
+                        <a href="{{{{LINK}}}}" style="background:#0284c7; color:#ffffff; padding:12px 24px; text-decoration:none; border-radius:8px; font-weight:bold; display:inline-block;">
+                            🚨 Oturumu Doğrula ve İptal Et
+                        </a>
+                    </div>
+                </div>
+                """,
+                "ipuclari": [
+                    "Telegram üzerinden gelen hesap doğrulama veya parola yenileme taleplerine doğrudan tıklanmamalıdır."
                 ]
             }
         else:

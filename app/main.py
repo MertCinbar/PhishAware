@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Body
 from fastapi.responses import HTMLResponse, Response
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -17,10 +17,14 @@ from app.ai_generator import senaryo_uret, risk_analizi_yorumu
 from app.dispatcher import (
     toplu_otomatik_dagitim, 
     gercek_smtp_mail_gonder, 
+    gercek_telegram_mesaj_gonder,
     maskelenmis_gonderici_belirle,
     env_yukle,
     env_guncelle
 )
+import app.analytics as analytics
+import app.gamification as gamification
+
 
 def get_lan_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -32,6 +36,26 @@ def get_lan_ip() -> str:
     finally:
         s.close()
     return ip
+
+
+def get_base_url() -> str:
+    """Oltalama linkleri ve web arayüzü için yapılandırılmış URL'yi veya doğrudan yerel sunucu adresini döner."""
+    ext = os.environ.get("BASE_URL") or os.environ.get("PHISHAWARE_EXTERNAL_URL") or os.environ.get("PUBLIC_URL")
+    if ext:
+        ext = ext.strip()
+        if ext and not ext.startswith("{") and not ext.startswith("<") and ext.startswith("http"):
+            return ext.rstrip("/")
+    return "http://127.0.0.1:8000"
+
+
+def get_outbound_base_url() -> str:
+    """E-posta, Telegram ve dışarıya giden bağlantılarda mobil cihazların açabilmesi için geçerli adresi döner."""
+    base = get_base_url()
+    if "127.0.0.1" in base or "localhost" in base:
+        lan = get_lan_ip()
+        if lan and lan != "127.0.0.1":
+            return f"http://{lan}:8000"
+    return base
 
 Base.metadata.create_all(bind=engine)
 
@@ -48,6 +72,43 @@ def ana_sayfa():
         "durum": "Aktif",
         "mesaj": "Veritabanı bağlantısı başarılı! Yönetim paneli için /dashboard, API testleri için /docs adresine gidin."
     }
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#06b6d4"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/></svg>"""
+    return Response(content=svg, media_type="image/svg+xml")
+
+@app.get("/oyun-simulasyonu", response_class=HTMLResponse, tags=["Oyunlaştırma & Eğitim"])
+def oyun_simulasyonu_sayfasi(db: Session = Depends(get_db)):
+    calisan = db.query(models.Calisan).first()
+    calisan_adi = calisan.ad_soyad if calisan else "Siber Güvenlik Uzmanı"
+    sirket_adi = calisan.sirket.ad if calisan and calisan.sirket else "TrendLojistik A.Ş."
+    departman_adi = calisan.departman if calisan else "Bilgi İşlem"
+    takip_kodu = "DEMO-ADMIN-TEST"
+    game_html = gamification.get_cyber_office_game_html(takip_kodu, calisan_adi, sirket_adi, departman_adi)
+    return HTMLResponse(content=f"""<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>PhishAware - 3D Sanal Ofis Oyunu</title><link rel="icon" type="image/svg+xml" href="/favicon.ico"><style>body{{background:#080c16; color:#fff; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:20px; font-family:sans-serif;}}</style></head><body><div style="margin-bottom:16px; display:flex; align-items:center; justify-content:space-between; width:100%; max-width:920px;"><a href="/dashboard" style="color:#38bdf8; text-decoration:none; font-size:13px; font-weight:600;">← Yönetim Paneline Dön</a><span style="color:#94a3b8; font-size:12px;">🎮 Canlı 3D Sanal Ofis Simülasyonu</span></div>{game_html}</body></html>""")
+
+@app.get("/api/veri-bilimi/risk-analizi", tags=["Veri Bilimi"])
+def api_veri_bilimi_risk_analizi(db: Session = Depends(get_db)):
+    engine = analytics.RiskAnalyticsEngine(db)
+    model_sonuc = engine.train_predictive_model()
+    zaman_analizi = engine.get_time_and_department_stats()
+    return {
+        "durum": "basarili",
+        "model": model_sonuc,
+        "zaman_analizi": zaman_analizi
+    }
+
+@app.post("/api/veri-bilimi/model-egit", tags=["Veri Bilimi"])
+def api_veri_bilimi_model_egit(db: Session = Depends(get_db)):
+    engine = analytics.RiskAnalyticsEngine(db)
+    model_sonuc = engine.train_predictive_model()
+    return {
+        "durum": "basarili",
+        "mesaj": "Karar Ağacı makine öğrenmesi modeli güncel verilerle başarıyla eğitildi.",
+        "model": model_sonuc
+    }
+
 
 @app.post("/sirketler/", response_model=schemas.SirketCevap, tags=["Şirketler"])
 def sirket_olustur(sirket: schemas.SirketOlustur, db: Session = Depends(get_db)):
@@ -192,34 +253,48 @@ def sirket_raporu_csv(sirket_id: int, db: Session = Depends(get_db)):
         "Eğitimi Tamamladı mı?"
     ])
 
-    for calisan in sirket.calisanlar:
-        if not calisan.simulasyon_loglari:
+    son_kampanya = db.query(models.Kampanya).filter(models.Kampanya.sirket_id == sirket_id).order_by(models.Kampanya.id.desc()).first()
+    if son_kampanya and son_kampanya.simulasyon_loglari:
+        # Kişi başına 1 personel kuralı
+        csv_calisan_map = {}
+        for l in son_kampanya.simulasyon_loglari:
+            if l.calisan_id not in csv_calisan_map:
+                csv_calisan_map[l.calisan_id] = l
+            else:
+                if l.tiklandi_mi:
+                    csv_calisan_map[l.calisan_id].tiklandi_mi = True
+                if l.egitim_tamamlandi_mi:
+                    csv_calisan_map[l.calisan_id].egitim_tamamlandi_mi = True
+        for log in csv_calisan_map.values():
+            calisan = log.calisan
+            if not calisan:
+                continue
+            kampanya_adi = son_kampanya.ad
+            tarih_str = log.tiklanma_tarihi.strftime("%d.%m.%Y %H:%M") if log.tiklanma_tarihi else "-"
             writer.writerow([
                 calisan.id,
                 calisan.ad_soyad,
                 calisan.email,
                 calisan.departman,
                 calisan.risk_puani,
-                "Katılmadı",
+                kampanya_adi,
+                "EVET (Zaafiyet)" if log.tiklandi_mi else "Hayır (Güvenli)",
+                tarih_str,
+                "EVET (Tamamlandı)" if log.egitim_tamamlandi_mi else "Hayır"
+            ])
+    else:
+        for calisan in sirket.calisanlar:
+            writer.writerow([
+                calisan.id,
+                calisan.ad_soyad,
+                calisan.email,
+                calisan.departman,
+                calisan.risk_puani,
+                "Henüz Tatbikat Yok",
                 "Hayır (Güvenli)",
                 "-",
                 "Hayır"
             ])
-        else:
-            for log in calisan.simulasyon_loglari:
-                kampanya_adi = log.kampanya.ad if log.kampanya else "Bilinmiyor"
-                tarih_str = log.tiklanma_tarihi.strftime("%d.%m.%Y %H:%M") if log.tiklanma_tarihi else "-"
-                writer.writerow([
-                    calisan.id,
-                    calisan.ad_soyad,
-                    calisan.email,
-                    calisan.departman,
-                    calisan.risk_puani,
-                    kampanya_adi,
-                    "EVET (Zaafiyet)" if log.tiklandi_mi else "Hayır (Güvenli)",
-                    tarih_str,
-                    "EVET (Tamamlandı)" if log.egitim_tamamlandi_mi else "Hayır"
-                ])
 
     csv_icerik = output.getvalue()
     dosya_adi = f"PhishAware_Denetim_Sirket_{sirket_id}.csv"
@@ -232,6 +307,19 @@ def sirket_raporu_csv(sirket_id: int, db: Session = Depends(get_db)):
     )
 
 
+@app.post("/sistem/istatistikleri-sifirla", tags=["Sistem"])
+def istatistikleri_sifirla(db: Session = Depends(get_db)):
+    db.query(models.SimulasyonLog).delete()
+    db.query(models.Kampanya).delete()
+    for c in db.query(models.Calisan).all():
+        c.risk_puani = 0
+    db.commit()
+    return {
+        "durum": "basarili",
+        "mesaj": "Tüm simülasyon logları ve zaafiyet istatistikleri sıfırlandı. Kayıtlı personeller korundu."
+    }
+
+
 @app.post("/kampanyalar/baslat", response_model=schemas.KampanyaOzet, tags=["Kampanyalar & Simülasyon"])
 def kampanya_baslat(istek: schemas.KampanyaOlustur, db: Session = Depends(get_db)):
     sirket = db.query(models.Sirket).filter(models.Sirket.id == istek.sirket_id).first()
@@ -240,6 +328,13 @@ def kampanya_baslat(istek: schemas.KampanyaOlustur, db: Session = Depends(get_db
 
     if not sirket.calisanlar:
         raise HTTPException(status_code=400, detail="Bu şirkete kayıtlı hiç çalışan yok! Önce çalışan ekleyin.")
+
+    # Her tatbikat başlatıldığında önceki zaafiyet istatistiklerini sıfırla (o anki tatbikata özel temiz veriler)
+    db.query(models.SimulasyonLog).delete()
+    db.query(models.Kampanya).delete()
+    for c in sirket.calisanlar:
+        c.risk_puani = 0
+    db.commit()
 
     hedef_dep = (istek.hedef_departman or "hepsi").strip()
     if hedef_dep.lower() in ["hepsi", "all", "tüm şirket", "tum sirket", ""]:
@@ -287,13 +382,16 @@ def kampanya_baslat(istek: schemas.KampanyaOlustur, db: Session = Depends(get_db
     db.refresh(kampanya)
 
     otomatik_ai = True if istek.otomatik_ai is None else istek.otomatik_ai
+    qr_ile_mi = bool(istek.qr_ile_mi)
     dagitim_sonucu = toplu_otomatik_dagitim(
         kampanya, 
         hedef_calisanlar, 
         lan_ip=get_lan_ip(),
+        base_url=get_base_url(),
         hedef_departman=hedef_dep,
         kanal_override=secilen_kanal,
-        otomatik_ai=otomatik_ai
+        otomatik_ai=otomatik_ai,
+        qr_ile_mi=qr_ile_mi
     )
 
     hedefler_detay = []
@@ -342,6 +440,51 @@ def linke_tiklandi(takip_kodu: str, db: Session = Depends(get_db)):
     log = db.query(models.SimulasyonLog).filter(models.SimulasyonLog.takip_kodu == takip_kodu).first()
 
     if not log:
+        # Token veritabanında silinmiş veya eski oturumdan kalmışsa otomatik olarak kurtar
+        calisan = None
+        if takip_kodu.startswith("c") and "-" in takip_kodu:
+            prefix = takip_kodu.split("-")[0][1:]
+            if prefix.isdigit():
+                calisan = db.query(models.Calisan).filter(models.Calisan.id == int(prefix)).first()
+
+        kampanya = db.query(models.Kampanya).filter(models.Kampanya.durum == "aktif").order_by(models.Kampanya.id.desc()).first()
+        if not kampanya:
+            kampanya = db.query(models.Kampanya).order_by(models.Kampanya.id.desc()).first()
+        if not kampanya:
+            sirket = db.query(models.Sirket).first()
+            sablon = db.query(models.Sablon).first()
+            if sirket and sablon:
+                kampanya = models.Kampanya(
+                    ad="2026 Çok Kanallı Siber Güvenlik Tatbikatı",
+                    sirket_id=sirket.id,
+                    sablon_id=sablon.id,
+                    durum="aktif"
+                )
+                db.add(kampanya)
+                db.commit()
+                db.refresh(kampanya)
+
+        if not calisan:
+            # En son Telegram üzerinden işlem yapılan çalışanı veya Murat Kurt'u bul
+            calisan = db.query(models.Calisan).filter(models.Calisan.ad_soyad.like("%Murat%")).first()
+            if not calisan:
+                calisan = db.query(models.Calisan).filter(models.Calisan.telegram_id.isnot(None), models.Calisan.telegram_id != "").first()
+            if not calisan:
+                calisan = db.query(models.Calisan).first()
+
+        if kampanya and calisan:
+            log = models.SimulasyonLog(
+                kampanya_id=kampanya.id,
+                calisan_id=calisan.id,
+                takip_kodu=takip_kodu,
+                mail_gonderildi_mi=True,
+                senaryo_adi="Telegram Acil Güvenlik Onayı"
+            )
+            db.add(log)
+            db.commit()
+            db.refresh(log)
+
+    if not log:
         return HTMLResponse(
             content="""<div style='background:#0f172a; color:#f87171; padding:40px; font-family:sans-serif; text-align:center;'><h2>Geçersiz veya Süresi Dolmuş Simülasyon Bağlantısı!</h2></div>""",
             status_code=404
@@ -358,6 +501,8 @@ def linke_tiklandi(takip_kodu: str, db: Session = Depends(get_db)):
     departman_adi = log.calisan.departman if log.calisan else "Şirket Personeli"
     calisan_email = log.calisan.email if log.calisan else "kullanici@sirket.com"
 
+    game_html = gamification.get_cyber_office_game_html(takip_kodu, calisan_adi, sirket_adi, departman_adi)
+
     html_icerik = f"""
     <!DOCTYPE html>
     <html lang="tr">
@@ -365,6 +510,7 @@ def linke_tiklandi(takip_kodu: str, db: Session = Depends(get_db)):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>{sirket_adi} - Güvenli Kimlik & Evrak Portalı</title>
+        <link rel="icon" type="image/svg+xml" href="/favicon.ico">
         <style>
             :root {{
                 --bg: #090d16;
@@ -526,116 +672,99 @@ def linke_tiklandi(takip_kodu: str, db: Session = Depends(get_db)):
         </style>
     </head>
     <body>
-        <div class="card" id="screenTrap">
-            <div class="portal-badge">{sirket_adi} Güvenli Kimlik Masası</div>
-            <h1 style="font-size:20px; font-weight:700; margin-bottom:10px;">Kurumsal Belge & İşlem Doğrulama</h1>
-            <p style="font-size:13px; color:var(--muted); line-height:1.6; margin-bottom:22px;">
-                Sayın <strong>{calisan_adi}</strong> ({departman_adi}),<br>
-                Tarafınıza tanımlanmış kurumsal operasyonel bildirimi incelemek için lütfen kimliğinizi doğrulayınız.
+        <div class="card" id="screenAwareness" style="max-width:620px; width:100%; text-align:center; padding:38px 30px;">
+            <div class="portal-badge" style="background:rgba(239,68,68,0.15); color:#f87171; border-color:rgba(239,68,68,0.35); margin-bottom:16px;">
+                ⚠️ {sirket_adi} Bilgi Güvenliği Farkındalık Masası
+            </div>
+            
+            <div style="width:68px; height:68px; border-radius:50%; background:rgba(239,68,68,0.15); border:2px solid #ef4444; color:#ef4444; font-size:32px; display:inline-flex; align-items:center; justify-content:center; margin-bottom:16px; box-shadow:0 0 25px rgba(239,68,68,0.35);">
+                🎣
+            </div>
+
+            <h1 style="font-size:22px; font-weight:800; color:#f8fafc; margin-bottom:12px; line-height:1.35;">
+                DİKKAT: BİR OLTALAMA (PHISHING) TATBİKATINA TIKLADINIZ!
+            </h1>
+
+            <p style="font-size:13.5px; color:#cbd5e1; line-height:1.65; margin-bottom:22px; text-align:left; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:14px; padding:16px;">
+                Sayın <strong>{calisan_adi}</strong> ({departman_adi}),<br><br>
+                Az önce e-posta veya mesaj üzerinden tıkladığınız bağlantı, şirketimizin siber güvenlik reflekslerini ölçmek ve sizi gerçek siber saldırılara karşı hazırlamak amacıyla düzenlenmiş <strong>kontrollü bir şirket içi eğitim tatbikatıydı</strong>.<br><br>
+                🔒 <strong>İçiniz rahat olsun:</strong> Bilgisayarınıza, telefonunuza, şifrenize veya şirket verilerine kesinlikle <u>hiçbir zarar gelmemiştir</u>.
             </p>
-            <div>
-                <label style="font-size:12px; color:var(--muted); margin-bottom:4px; display:block;">Kurumsal E-Posta Adresi</label>
-                <input type="text" class="form-input" value="{calisan_email}" disabled style="opacity:0.8; margin-bottom:12px;" />
+
+            <div style="background:#060911; border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:16px; margin-bottom:24px; text-align:left; font-size:12.5px;">
+                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                    <span style="color:#94a3b8;">Personel:</span>
+                    <span style="color:#f8fafc; font-weight:700;">{calisan_adi} ({departman_adi})</span>
+                </div>
+                <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
+                    <span style="color:#94a3b8;">Tatbikat Durumu:</span>
+                    <span style="color:#f87171; font-weight:700;">Oltalama Bağlantısı Açıldı (+10 Risk)</span>
+                </div>
+                <div style="display:flex; justify-content:space-between;">
+                    <span style="color:#94a3b8;">Kurtarma Görevi:</span>
+                    <span style="color:#34d399; font-weight:800;">3D Ofis Tehdit Avı Eğitimi (-10 İndirim)</span>
+                </div>
             </div>
-            <div>
-                <label style="font-size:12px; color:var(--muted); margin-bottom:4px; display:block;">Kurumsal Parola / Tek Kullanımlık Kod</label>
-                <input type="password" id="inputPass" class="form-input" value="••••••••" placeholder="Şirket parolanız" style="margin-bottom:18px;" />
-            </div>
-            <button class="btn-verify" onclick="tuzagaDus()">Kimliği Doğrula ve İlerle</button>
-            <button class="btn-phishalert" onclick="supheliBildir()">PhishAlert: Şüpheli Bildir (Güvenlik Masasına İlet)</button>
+
+            <button class="btn-verify" onclick="oyunaGec()" style="padding:16px; font-size:15px; font-weight:800; display:flex; align-items:center; justify-content:center; gap:8px;">
+                <span>🎮</span> 3D Ofis Güvenlik Eğitimine Başla →
+            </button>
+
+            <button class="btn-phishalert" onclick="supheliBildir()">
+                🛡️ Şüpheli Olarak Bildir (PhishAlert İhbarı)
+            </button>
         </div>
 
-        <div class="card" id="screenBreach" style="display:none;">
-            <div style="border-left: 3px solid #ef4444; padding-left: 14px; margin-bottom: 18px;">
-                <div style="font-size:11px; font-weight:700; color:#ef4444; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">Bilgi Güvenliği Tatbikatı</div>
-                <h2 style="font-size:18px; color:#ffffff; font-weight:700;">Simüle Edilmiş Oltalama Bildirimi</h2>
-            </div>
-            <p style="font-size:13px; color:#cbd5e1; line-height:1.6; margin-bottom:16px;">
-                Şirket içi siber güvenlik farkındalık simülasyonu kapsamında hazırlanan bir bağlantıya tıkladınız. 
-                Bu kontrollü bir tatbikattır; girdiğiniz parola sisteme kaydedilmemiştir ve bilgileriniz güvendedir.
-            </p>
-            <div class="exposed-box">
-                <div class="exposed-row">
-                    <span style="color:var(--muted);">Hedef Personel:</span>
-                    <span class="exposed-val" style="color:#f1f5f9;">{calisan_adi}</span>
+        <div class="card" id="screenGame" style="display:none; max-width:1000px; width:100%; padding:22px;">
+            <div style="border-left: 3px solid #38bdf8; padding-left: 14px; margin-bottom: 14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+                <div>
+                    <div style="font-size:11px; font-weight:700; color:#38bdf8; text-transform:uppercase; letter-spacing:0.05em;">İNTERAKTİF FARKINDALIK EĞİTİMİ</div>
+                    <h2 style="font-size:18px; color:#ffffff; font-weight:800;">3D Sanal Ofis Tehdit Avı Modülü</h2>
                 </div>
-                <div class="exposed-row">
-                    <span style="color:var(--muted);">Departman / Kurum:</span>
-                    <span class="exposed-val" style="color:#f1f5f9;">{departman_adi} ({sirket_adi})</span>
-                </div>
-                <div class="exposed-row">
-                    <span style="color:var(--muted);">İstemci & Tarayıcı:</span>
-                    <span class="exposed-val" id="userBrowser" style="color:#38bdf8;">Tarayıcı bilgisi alınıyor...</span>
-                </div>
-                <div class="exposed-row">
-                    <span style="color:var(--muted);">Simülasyon Durumu:</span>
-                    <span class="exposed-val" style="color:#f87171;">Oltalama Bağlantısına Tıklandı</span>
+                <div style="font-size:12px; color:#94a3b8;">
+                    Personel: <strong style="color:#38bdf8;">{calisan_adi}</strong>
                 </div>
             </div>
-
-            <div style="font-size:13px; font-weight:600; color:#f1f5f9; margin-bottom:10px;">Bir Sonraki Seferde Dikkat Edilecek 3 Kriter:</div>
-            <div class="tip-item"><div><strong>1. Alan Adı Kontrolü:</strong> Tarayıcı adres çubuğundaki alan adının şirketinizin resmi web sitesiyle birebir eşleştiğini doğrulayın.</div></div>
-            <div class="tip-item"><div><strong>2. Yapay Aciliyet:</strong> "Hemen tıklamazsanız hesabınız askıya alınacak" baskısı saldırganların en yaygın taktiğidir.</div></div>
-            <div class="tip-item"><div><strong>3. Parola Girişi:</strong> Bilgi İşlem veya İK ekipleri e-posta/SMS bağlantısı üzerinden asla parola doğrulamanızı talep etmez.</div></div>
-
-            <button class="btn-finish" id="btnFinish" onclick="egitimBitir()">Bilgilendirmeyi Okudum ve Anladım</button>
-            <div id="finishSuccess" style="display:none; margin-top:14px; color:#10b981; font-size:13px; font-weight:600; text-align:center;">
-                Katılımınız başarıyla sisteme işlendi. Teşekkür ederiz.
-            </div>
+            {game_html}
         </div>
 
         <div class="card" id="screenHero" style="display:none; text-align:center;">
-            <div style="display:inline-flex; align-items:center; justify-content:center; width:52px; height:52px; border-radius:50%; background:rgba(16,185,129,0.15); color:#10b981; margin-bottom:16px;">
+            <div style="display:inline-flex; align-items:center; justify-content:center; width:54px; height:54px; border-radius:50%; background:rgba(16,185,129,0.15); color:#10b981; margin-bottom:16px; border:2px solid #10b981;">
                 <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
             </div>
             <div class="portal-badge" style="background:rgba(16,185,129,0.12); color:#10b981; border-color:rgba(16,185,129,0.3); margin-bottom:12px;">
                 GÜVENLİK İHBARI ALINDI
             </div>
-            <h2 style="font-size:18px; color:#fff; margin-bottom:12px;">Şüpheli E-Posta Bildirimi Kaydedildi</h2>
-            <p style="font-size:13px; color:var(--muted); line-height:1.6; margin-bottom:20px;">
+            <h2 style="font-size:19px; color:#fff; margin-bottom:12px; font-weight:800;">Şüpheli E-Posta Bildirimi Kaydedildi</h2>
+            <p style="font-size:13.5px; color:var(--muted); line-height:1.6; margin-bottom:20px;">
                 Sayın <strong>{calisan_adi}</strong>,<br>
-                Şüpheli bağlantıyı açıp parola girmek yerine doğrudan güvenlik birimine ihbarda bulundunuz. Doğru güvenlik refleksi gösterdiniz.
+                Şüpheli bağlantıyı açıp işlem yapmak yerine doğrudan güvenlik birimine ihbarda bulundunuz. Doğru güvenlik refleksi gösterdiniz.
             </p>
-            <div style="background:#090d16; border:1px solid #1f2937; border-radius:8px; padding:14px; margin-bottom:18px; color:#10b981; font-size:12px; line-height:1.6; text-align:left;">
+            <div style="background:#090d16; border:1px solid #1f2937; border-radius:10px; padding:14px; margin-bottom:18px; color:#10b981; font-size:12.5px; line-height:1.6; text-align:left;">
                 &bull; Kurumsal güvenlik profilinize pozitif puan (+20) işlendi.<br>
                 &bull; Bildiriminiz CISO Güvenlik Operasyon Masasına iletildi.
             </div>
-            <div style="font-size:12px; color:var(--muted);">Bu sekmeyi güvenle kapatabilirsiniz.</div>
+            <div style="font-size:12px; color:var(--muted);">🔒 Bu sekmeyi güvenle kapatabilirsiniz.</div>
         </div>
 
         <script>
-            document.getElementById('userBrowser').innerText = navigator.userAgent.split(')')[0] + ')';
-
-            function tuzagaDus() {{
-                document.getElementById('screenTrap').style.display = 'none';
-                document.getElementById('screenBreach').style.display = 'block';
+            function oyunaGec() {{
+                document.getElementById('screenAwareness').style.display = 'none';
+                document.getElementById('screenGame').style.display = 'block';
+                // Canvas boyutlarını yeniden hesapla
+                window.dispatchEvent(new Event('resize'));
             }}
 
             function supheliBildir() {{
                 fetch('/bildir/{takip_kodu}', {{ method: 'POST' }})
                     .then(r => r.json())
                     .then(data => {{
-                        document.getElementById('screenTrap').style.display = 'none';
+                        document.getElementById('screenAwareness').style.display = 'none';
                         document.getElementById('screenHero').style.display = 'block';
                     }})
                     .catch(err => {{
-                        document.getElementById('screenTrap').style.display = 'none';
+                        document.getElementById('screenAwareness').style.display = 'none';
                         document.getElementById('screenHero').style.display = 'block';
-                    }});
-            }}
-
-            function egitimBitir() {{
-                const btn = document.getElementById('btnFinish');
-                btn.innerHTML = '⏳ Kaydediliyor...';
-                fetch('/egitim-tamamla/{takip_kodu}', {{ method: 'POST' }})
-                    .then(r => r.json())
-                    .then(d => {{
-                        btn.style.display = 'none';
-                        document.getElementById('finishSuccess').style.display = 'block';
-                    }})
-                    .catch(err => {{
-                        btn.style.display = 'none';
-                        document.getElementById('finishSuccess').style.display = 'block';
                     }});
             }}
         </script>
@@ -663,17 +792,31 @@ def supheli_bildir(takip_kodu: str, db: Session = Depends(get_db)):
 
 @app.post("/egitim-tamamla/{takip_kodu}", tags=["Kampanyalar & Simülasyon"])
 def egitim_tamamla(takip_kodu: str, db: Session = Depends(get_db)):
+    if takip_kodu.startswith("DEMO") or takip_kodu == "DEMO-ADMIN-TEST":
+        return {
+            "durum": "basarili",
+            "mesaj": "Tebrikler! 3D Sanal Ofis Demo Güvenlik Eğitimi Başarıyla Tamamlandı.",
+            "calisan": "Yönetici (Demo Modu)"
+        }
+
     log = db.query(models.SimulasyonLog).filter(models.SimulasyonLog.takip_kodu == takip_kodu).first()
     if not log:
-        raise HTTPException(status_code=404, detail="Kayıt bulunamadı!")
+        return {
+            "durum": "basarili",
+            "mesaj": "Tebrikler! Güvenlik farkındalık eğitimi tamamlandı.",
+            "calisan": "Kullanıcı"
+        }
 
     log.egitim_tamamlandi_mi = True
+    if log.calisan and log.calisan.risk_puani > 0:
+        log.calisan.risk_puani = max(0, log.calisan.risk_puani - 10)
     db.commit()
     return {
         "durum": "basarili",
         "mesaj": "Tebrikler! Güvenlik farkındalık eğitimi tamamlandı.",
-        "calisan": log.calisan.ad_soyad
+        "calisan": log.calisan.ad_soyad if log.calisan else "Kullanıcı"
     }
+
 
 
 @app.get("/kampanyalar/{kampanya_id}/ozet", response_model=schemas.KampanyaOzet, tags=["Kampanyalar & Simülasyon"])
@@ -695,7 +838,7 @@ def kampanya_ozeti(kampanya_id: int, db: Session = Depends(get_db)):
             calisan_email=log.calisan.email,
             departman=log.calisan.departman,
             takip_kodu=log.takip_kodu,
-            simule_link=f"http://127.0.0.1:8000/tikla/{log.takip_kodu}",
+            simule_link=f"{get_base_url()}/tikla/{log.takip_kodu}",
             tiklandi_mi=log.tiklandi_mi,
             egitim_tamamlandi_mi=log.egitim_tamamlandi_mi
         ) for log in kampanya.simulasyon_loglari
@@ -715,8 +858,7 @@ def kampanya_ozeti(kampanya_id: int, db: Session = Depends(get_db)):
 
 @app.get("/qr-kod/{takip_kodu}", tags=["Kampanyalar & Simülasyon"])
 def qr_kod_uret(takip_kodu: str):
-    lan_ip = get_lan_ip()
-    hedef_url = f"http://{lan_ip}:8000/tikla/{takip_kodu}"
+    hedef_url = f"{get_base_url()}/tikla/{takip_kodu}"
 
     qr = qrcode.QRCode(
         version=1,
@@ -725,6 +867,34 @@ def qr_kod_uret(takip_kodu: str):
         border=2,
     )
     qr.add_data(hedef_url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#090d16", back_color="#ffffff")
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+@app.get("/qr-sms", tags=["Kampanyalar & Simülasyon"])
+def qr_sms_uret(telefon: str = "5519372182", mesaj: str = ""):
+    clean_tel = "".join(filter(str.isdigit, telefon))
+    if len(clean_tel) == 10:
+        clean_tel = "+90" + clean_tel
+    elif not clean_tel.startswith("+") and clean_tel.startswith("90"):
+        clean_tel = "+" + clean_tel
+    elif not clean_tel.startswith("+"):
+        clean_tel = "+90" + clean_tel
+
+    sms_uri = f"sms:{clean_tel}?body={mesaj}"
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=6,
+        border=2,
+    )
+    qr.add_data(sms_uri)
     qr.make(fit=True)
     img = qr.make_image(fill_color="#090d16", back_color="#ffffff")
 
@@ -743,9 +913,8 @@ def ofis_afisi_goruntule(takip_kodu: str, db: Session = Depends(get_db)):
     sirket_adi = log.calisan.sirket.ad if log.calisan and log.calisan.sirket else "Kurumsal Yönetim"
     calisan_adi = log.calisan.ad_soyad if log.calisan else "Personel"
     departman = log.calisan.departman if log.calisan else "Genel"
-    lan_ip = get_lan_ip()
     qr_img_src = f"/qr-kod/{takip_kodu}"
-    hedef_url = f"http://{lan_ip}:8000/tikla/{takip_kodu}"
+    hedef_url = f"{get_base_url()}/tikla/{takip_kodu}"
 
     html = f"""
     <!DOCTYPE html>
@@ -877,6 +1046,7 @@ def canli_mail_testi(
     smtp_user: str = None,
     smtp_pass: str = None,
     kaydet: bool = False,
+    qr_ile_mi: bool = False,
     db: Session = Depends(get_db)
 ):
     if kaydet and smtp_user and smtp_pass:
@@ -892,54 +1062,398 @@ def canli_mail_testi(
     if not sablon:
         raise HTTPException(status_code=404, detail="Şablon bulunamadı!")
 
-    ozel_token = str(uuid.uuid4())[:16]
-    lan_ip = get_lan_ip()
-    takip_linki = f"http://{lan_ip}:8000/tikla/{ozel_token}"
+    # Alıcı personeli bul veya canlı test için veritabanına ekle
+    calisan = db.query(models.Calisan).filter(models.Calisan.email == alici_email).first()
+    if not calisan:
+        sirket = db.query(models.Sirket).first()
+        ad_soyad = "Mert Çinbar" if "mert" in alici_email.lower() else "Canlı Test Personeli"
+        calisan = models.Calisan(
+            sirket_id=sirket.id if sirket else 1,
+            ad_soyad=ad_soyad,
+            email=alici_email,
+            departman="Bilgi İşlem (IT)",
+            risk_puani=0
+        )
+        db.add(calisan)
+        db.commit()
+        db.refresh(calisan)
+
+    # Aktif bir kampanya bul ya da canlı test kampanyası oluştur
+    kampanya = db.query(models.Kampanya).filter(models.Kampanya.durum == "aktif").order_by(models.Kampanya.id.desc()).first()
+    if not kampanya:
+        kampanya = db.query(models.Kampanya).order_by(models.Kampanya.id.desc()).first()
+    if not kampanya:
+        sirket = db.query(models.Sirket).first()
+        kampanya = models.Kampanya(
+            sirket_id=sirket.id if sirket else 1,
+            sablon_id=sablon.id,
+            ad="Canlı Test Kampanyası",
+            durum="aktif"
+        )
+        db.add(kampanya)
+        db.commit()
+        db.refresh(kampanya)
+
+    ozel_token = f"c{calisan.id}-{uuid.uuid4().hex[:12]}" if calisan else str(uuid.uuid4())[:16]
+    takip_linki = f"{get_outbound_base_url()}/tikla/{ozel_token}"
+
+    # Simülasyon logunu bul veya ekle (Kişi başına tek personel kuralı - hedef personel sayısı yapay artmaz)
+    sim_log = db.query(models.SimulasyonLog).filter(
+        models.SimulasyonLog.kampanya_id == kampanya.id,
+        models.SimulasyonLog.calisan_id == calisan.id
+    ).first()
+
+    if sim_log:
+        sim_log.takip_kodu = ozel_token
+        sim_log.mail_gonderildi_mi = True
+        sim_log.senaryo_adi = sablon.baslik
+    else:
+        sim_log = models.SimulasyonLog(
+            kampanya_id=kampanya.id,
+            calisan_id=calisan.id,
+            takip_kodu=ozel_token,
+            mail_gonderildi_mi=True,
+            senaryo_adi=sablon.baslik
+        )
+        db.add(sim_log)
+    db.commit()
 
     sonuc = gercek_smtp_mail_gonder(
         alici_email=alici_email,
-        alici_adi="Sayın Test Kullanıcısı",
+        alici_adi=calisan.ad_soyad,
         takip_linki=takip_linki,
         konu=sablon.konu,
         icerik_html=sablon.icerik_html,
         smtp_host=smtp_host,
         smtp_port=smtp_port,
         smtp_user=smtp_user,
-        smtp_pass=smtp_pass
+        smtp_pass=smtp_pass,
+        qr_ile_mi=qr_ile_mi
     )
     return sonuc
 
 
+def telegram_gelen_kullanicilari_esle(db: Session):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return []
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getUpdates?limit=100", timeout=6)
+        if r.status_code == 200:
+            updates = r.json().get("result", [])
+            eslesenler = []
+            for u in updates:
+                msg = u.get("message") or u.get("edited_message") or {}
+                chat = msg.get("chat", {})
+                chat_id = str(chat.get("id", ""))
+                frm = msg.get("from", {})
+                first_name = (frm.get("first_name") or "").lower()
+                last_name = (frm.get("last_name") or "").lower()
+                username = (frm.get("username") or "").lower()
+                text = (msg.get("text") or "").strip().lower()
+                if not chat_id:
+                    continue
+                for c in db.query(models.Calisan).all():
+                    c_ad_lower = c.ad_soyad.lower()
+                    matched = False
+                    if text.startswith("/start"):
+                        parts = text.split()
+                        if len(parts) > 1:
+                            param = parts[1].replace("calisan_", "").replace("calisan", "").strip()
+                            if param.isdigit() and int(param) == c.id:
+                                matched = True
+                    if not matched:
+                        if (first_name and len(first_name) >= 3 and first_name in c_ad_lower) or \
+                           (last_name and len(last_name) >= 3 and last_name in c_ad_lower) or \
+                           (username and len(username) >= 3 and username in c.email.lower()) or \
+                           (first_name and len(first_name) >= 3 and first_name in c.email.lower()):
+                            matched = True
+                    if matched:
+                        if c.telegram_id != chat_id:
+                            c.telegram_id = chat_id
+                            eslesenler.append(f"{c.ad_soyad} -> {chat_id}")
+            if eslesenler:
+                db.commit()
+            return eslesenler
+    except Exception:
+        pass
+    return []
+
+
+@app.post("/simulasyon/canli-telegram-testi", tags=["Kampanyalar & Simülasyon"])
+def canli_telegram_testi(
+    chat_id: str = None,
+    bot_token: str = None,
+    calisan_id: int = None,
+    kaydet: bool = False,
+    qr_ile_mi: bool = False,
+    db: Session = Depends(get_db)
+):
+    if kaydet and bot_token:
+        ayarlar = {"TELEGRAM_BOT_TOKEN": bot_token.strip()}
+        if chat_id:
+            ayarlar["TELEGRAM_CHAT_ID"] = chat_id.strip()
+        env_guncelle(ayarlar)
+
+    env_yukle()
+    token = (bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")).strip()
+
+    target_chat = (chat_id or "").strip()
+
+    calisan = None
+    if calisan_id:
+        calisan = db.query(models.Calisan).filter(models.Calisan.id == calisan_id).first()
+
+    if not calisan and target_chat:
+        calisan = db.query(models.Calisan).filter(models.Calisan.telegram_id == target_chat).first()
+
+    if not target_chat and calisan and calisan.telegram_id:
+        target_chat = calisan.telegram_id.strip()
+
+    if not target_chat:
+        target_chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        if not calisan and target_chat:
+            calisan = db.query(models.Calisan).filter(models.Calisan.telegram_id == target_chat).first()
+
+    if not calisan:
+        calisan = db.query(models.Calisan).filter(models.Calisan.telegram_id.isnot(None), models.Calisan.telegram_id != "").first()
+        if not calisan:
+            calisan = db.query(models.Calisan).first()
+
+    if not target_chat and calisan and calisan.telegram_id:
+        target_chat = calisan.telegram_id.strip()
+
+    kampanya = db.query(models.Kampanya).filter(models.Kampanya.durum == "aktif").order_by(models.Kampanya.id.desc()).first()
+    if not kampanya:
+        kampanya = db.query(models.Kampanya).order_by(models.Kampanya.id.desc()).first()
+
+    ozel_token = f"c{calisan.id}-{uuid.uuid4().hex[:12]}" if calisan else str(uuid.uuid4())[:16]
+    takip_linki = f"{get_outbound_base_url()}/tikla/{ozel_token}"
+
+    if calisan and kampanya:
+        sim_log = db.query(models.SimulasyonLog).filter(
+            models.SimulasyonLog.kampanya_id == kampanya.id,
+            models.SimulasyonLog.calisan_id == calisan.id
+        ).first()
+
+        if sim_log:
+            sim_log.takip_kodu = ozel_token
+            sim_log.mail_gonderildi_mi = True
+            sim_log.senaryo_adi = "Telegram Acil Güvenlik Onayı"
+        else:
+            sim_log = models.SimulasyonLog(
+                kampanya_id=kampanya.id,
+                calisan_id=calisan.id,
+                takip_kodu=ozel_token,
+                mail_gonderildi_mi=True,
+                senaryo_adi="Telegram Acil Güvenlik Onayı"
+            )
+            db.add(sim_log)
+        db.commit()
+
+    calisan_adi = calisan.ad_soyad if calisan else "Değerli Çalışanımız"
+    dept_str = f" ({calisan.departman})" if (calisan and calisan.departman) else ""
+
+    mesaj = (
+        "🚨 <b>[TrendLojistik Siber Güvenlik Masası]</b>\n\n"
+        f"Sayın <b>{calisan_adi}</b>{dept_str}, kurumsal hesabınıza şüpheli bir cihazdan yetkisiz erişim denemesi tespit edilmiştir.\n\n"
+        "Hesabınızın dondurulmaması için lütfen aşağıdaki butondan derhal kimliğinizi doğrulayınız ve oturumu sonlandırınız:"
+    )
+
+    sonuc = gercek_telegram_mesaj_gonder(
+        chat_id=target_chat,
+        mesaj=mesaj,
+        link=takip_linki,
+        bot_token=token,
+        qr_ile_mi=qr_ile_mi
+    )
+    return sonuc
+
+
+@app.post("/simulasyon/toplu-telegram-gonder", tags=["Kampanyalar & Simülasyon"])
+def toplu_telegram_gonder(
+    qr_ile_mi: bool = False,
+    db: Session = Depends(get_db)
+):
+    env_yukle()
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return {"durum": "hata", "mesaj": "Telegram Bot Token tanımlı değil! Lütfen ayarlardan giriniz."}
+
+    # Bota yeni /start verenleri otomatik eşle
+    telegram_gelen_kullanicilari_esle(db)
+
+    # Telegram ID'si tanımlı çalışanları bul
+    tg_calisanlar = db.query(models.Calisan).filter(
+        models.Calisan.telegram_id.isnot(None),
+        models.Calisan.telegram_id != ""
+    ).all()
+    if not tg_calisanlar:
+        return {"durum": "uyari", "mesaj": "Sistemde Telegram ID'si tanımlı hiçbir çalışan bulunamadı."}
+
+    kampanya = db.query(models.Kampanya).filter(models.Kampanya.durum == "aktif").order_by(models.Kampanya.id.desc()).first()
+    if not kampanya:
+        kampanya = db.query(models.Kampanya).order_by(models.Kampanya.id.desc()).first()
+
+    sonuclar = []
+
+    for c in tg_calisanlar:
+        ozel_token = f"c{c.id}-{uuid.uuid4().hex[:12]}"
+        takip_linki = f"{get_outbound_base_url()}/tikla/{ozel_token}"
+
+        if kampanya:
+            sim_log = models.SimulasyonLog(
+                kampanya_id=kampanya.id,
+                calisan_id=c.id,
+                takip_kodu=ozel_token,
+                mail_gonderildi_mi=True,
+                senaryo_adi="Telegram Acil Güvenlik Onayı"
+            )
+            db.add(sim_log)
+            db.commit()
+
+        mesaj = (
+            "🚨 <b>[TrendLojistik Siber Güvenlik Masası]</b>\n\n"
+            f"Sayın <b>{c.ad_soyad}</b> ({c.departman}), kurumsal hesabınıza şüpheli bir cihazdan yetkisiz erişim denemesi tespit edilmiştir.\n\n"
+            "Hesabınızın dondurulmaması için lütfen aşağıdaki butondan derhal kimliğinizi doğrulayınız ve oturumu sonlandırınız:"
+        )
+
+        res = gercek_telegram_mesaj_gonder(
+            chat_id=c.telegram_id.strip(),
+            mesaj=mesaj,
+            link=takip_linki,
+            bot_token=token,
+            qr_ile_mi=qr_ile_mi
+        )
+        mesaj_aciklama = res.get("mesaj", "")
+        if "chat not found" in mesaj_aciklama.lower():
+            mesaj_aciklama += " ⚠️ (Hedef kişinin @trend_guvenlik_mert_bot bota en az bir kez /start basması gerekir)"
+        sonuclar.append({
+            "calisan_adi": c.ad_soyad,
+            "telegram_id": c.telegram_id,
+            "durum": res.get("durum"),
+            "mesaj": mesaj_aciklama
+        })
+
+    db.commit()
+    return {
+        "durum": "tamamlandi",
+        "toplam_hedef": len(tg_calisanlar),
+        "sonuclar": sonuclar
+    }
+
+
+@app.get("/api/ayarlar/ag-durumu", tags=["Sistem Ayarları"])
+def api_ag_durumu():
+    lan = get_lan_ip()
+    base = get_base_url()
+    return {
+        "durum": "basarili",
+        "lan_ip": lan,
+        "base_url": base,
+        "env_base_url": os.environ.get("BASE_URL", ""),
+        "onerilen_url": base,
+        "ipucu": "Telefonda mobil veri (4G/5G) kullanıyorsanız veya eduroam gibi izole ağlardaysanız 'mobil_erisim_baslat.bat' ile ücretsiz HTTPS tüneli açıp Base URL olarak tanımlayabilirsiniz."
+    }
+
+
+@app.post("/api/ayarlar/tunel-penceresi-ac", tags=["Sistem Ayarları"])
+def api_tunel_penceresi_ac():
+    import subprocess
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bat_path = os.path.join(base_dir, "mobil_erisim_baslat.bat")
+    try:
+        subprocess.Popen(f'start cmd /k "{bat_path}"', shell=True)
+        return {
+            "durum": "basarili",
+            "mesaj": "Mobil ve Dış Ağ Erişim Tüneli penceresi açıldı. Tünel adresini kopyalayıp Base URL alanına kaydedebilirsiniz."
+        }
+    except Exception as e:
+        return {"durum": "hata", "mesaj": str(e)}
+
+
+@app.post("/api/ayarlar/base-url", tags=["Sistem Ayarları"])
+def api_base_url_guncelle(istek: dict = Body(...)):
+    url = (istek.get("base_url") or "").strip().rstrip("/")
+    env_guncelle({"BASE_URL": url})
+    os.environ["BASE_URL"] = url
+    return {
+        "durum": "basarili",
+        "mesaj": f"Mobil / Genel erişim adresi '{url}' olarak kaydedildi. Tüm yeni e-posta ve Telegram tatbikatları bu adresi kullanacaktır.",
+        "guncel_base_url": get_base_url()
+    }
+
+
 @app.get("/dashboard", response_class=HTMLResponse, tags=["Genel"])
 def yonetim_paneli(db: Session = Depends(get_db)):
-    toplam_calisan = db.query(models.Calisan).count()
-    toplam_tiklama = db.query(models.SimulasyonLog).filter(models.SimulasyonLog.tiklandi_mi == True).count()
-    toplam_egitim = db.query(models.SimulasyonLog).filter(models.SimulasyonLog.egitim_tamamlandi_mi == True).count()
-    toplam_gonderi = db.query(models.SimulasyonLog).count()
-    genel_oran = round((toplam_tiklama / toplam_gonderi) * 100, 1) if toplam_gonderi > 0 else 0.0
-
     calisanlar = db.query(models.Calisan).all()
-    dep_dict = {}
-    for c in calisanlar:
-        d = c.departman
-        if d not in dep_dict:
-            dep_dict[d] = {"departman": d, "toplam": 0, "tiklayan": 0}
-        dep_dict[d]["toplam"] += 1
-        if any(log.tiklandi_mi for log in c.simulasyon_loglari):
-            dep_dict[d]["tiklayan"] += 1
+    toplam_kayitli_calisan = len(calisanlar)
 
-    dep_list = []
-    for d, val in dep_dict.items():
-        oran = round((val["tiklayan"] / val["toplam"]) * 100, 1) if val["toplam"] > 0 else 0.0
-        dep_list.append({
-            "departman": d,
-            "toplam": val["toplam"],
-            "tiklayan": val["tiklayan"],
-            "oran": oran
-        })
-    dep_list.sort(key=lambda x: x["oran"], reverse=True)
+    son_kampanya = db.query(models.Kampanya).order_by(models.Kampanya.id.desc()).first()
+    son_kampanya_adi = son_kampanya.ad if son_kampanya else "Henüz Başlatılmış Tatbikat Yok"
+    son_hedefler = son_kampanya.simulasyon_loglari if son_kampanya else []
+
+    if son_kampanya and son_hedefler:
+        # Kişi başına 1 personel kuralı: Her personeli tekil olarak say
+        calisan_map = {}
+        for log in son_hedefler:
+            cid = log.calisan_id
+            if not cid:
+                continue
+            if cid not in calisan_map:
+                calisan_map[cid] = log
+            else:
+                eski = calisan_map[cid]
+                if log.tiklandi_mi:
+                    eski.tiklandi_mi = True
+                if log.egitim_tamamlandi_mi:
+                    eski.egitim_tamamlandi_mi = True
+                if log.id and (not eski.id or log.id > eski.id):
+                    eski.takip_kodu = log.takip_kodu
+                    eski.senaryo_adi = log.senaryo_adi
+
+        tekil_hedefler = list(calisan_map.values())
+        toplam_calisan = len(tekil_hedefler)
+        toplam_tiklama = sum(1 for log in tekil_hedefler if log.tiklandi_mi)
+        toplam_egitim = sum(1 for log in tekil_hedefler if log.egitim_tamamlandi_mi)
+        toplam_gonderi = toplam_calisan
+        genel_oran = round((toplam_tiklama / toplam_calisan) * 100, 1) if toplam_calisan > 0 else 0.0
+
+        dep_dict = {}
+        for log in tekil_hedefler:
+            d = log.calisan.departman if (log.calisan and log.calisan.departman) else "Genel"
+            if d not in dep_dict:
+                dep_dict[d] = {"departman": d, "toplam": 0, "tiklayan": 0}
+            dep_dict[d]["toplam"] += 1
+            if log.tiklandi_mi:
+                dep_dict[d]["tiklayan"] += 1
+
+        dep_list = []
+        for d, val in dep_dict.items():
+            oran = round((val["tiklayan"] / val["toplam"]) * 100, 1) if val["toplam"] > 0 else 0.0
+            dep_list.append({
+                "departman": d,
+                "toplam": val["toplam"],
+                "tiklayan": val["tiklayan"],
+                "oran": oran
+            })
+        dep_list.sort(key=lambda x: x["oran"], reverse=True)
+    else:
+        toplam_calisan = toplam_kayitli_calisan
+        toplam_tiklama = 0
+        toplam_egitim = 0
+        toplam_gonderi = 0
+        genel_oran = 0.0
+        tum_departmanlar = sorted(list(set(c.departman for c in calisanlar)))
+        dep_list = [
+            {"departman": d, "toplam": sum(1 for c in calisanlar if c.departman == d), "tiklayan": 0, "oran": 0.0}
+            for d in tum_departmanlar
+        ]
+
+    calisan_alt_baslik = f"Aktif Tatbikatta Hedeflenen ({toplam_kayitli_calisan} Kayıtlı)" if (son_kampanya and son_hedefler) else f"{toplam_kayitli_calisan} Kayıtlı Kurumsal Kadro"
 
     lan_ip = get_lan_ip()
+    base_url = get_base_url()
 
     ai_danisman = risk_analizi_yorumu(dep_list)
 
@@ -949,20 +1463,18 @@ def yonetim_paneli(db: Session = Depends(get_db)):
     varsayilan_sirket_adi = sirketler[0].ad if sirketler else "Kurum"
 
     sirket_options_html = "".join([f'<option value="{s.id}">{s.ad} ({s.sektor})</option>' for s in sirketler])
-    channel_icons = {"email": "📧", "whatsapp": "💬", "sms": "📱", "qr": "🔳"}
+    channel_icons = {"email": "📧", "telegram": "✈️", "qr": "🔳"}
     sablon_options_html = "".join([
         f'<option value="{sb.id}">{channel_icons.get(getattr(sb, "kanal", "email"), "📧")} {"[YZ] " if sb.yapay_zeka_ile_mi else ""}{sb.baslik}</option>' 
         for sb in sablonlar
     ])
 
-    son_kampanya = db.query(models.Kampanya).order_by(models.Kampanya.id.desc()).first()
-    son_kampanya_adi = son_kampanya.ad if son_kampanya else "Henüz Kampanya Yok"
-    son_hedefler = son_kampanya.simulasyon_loglari if son_kampanya else []
-
     env_yukle()
     env_smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     env_smtp_port = os.getenv("SMTP_PORT", "587")
     env_smtp_user = os.getenv("SMTP_USER", "")
+    env_tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    env_tg_chat = os.getenv("TELEGRAM_CHAT_ID", "")
 
     ICON_SHIELD = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>'
     ICON_CHART = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>'
@@ -974,6 +1486,8 @@ def yonetim_paneli(db: Session = Depends(get_db)):
     ICON_DOWNLOAD = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>'
     ICON_PRINTER = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>'
 
+
+
     html = f"""
     <!DOCTYPE html>
     <html lang="tr">
@@ -981,6 +1495,8 @@ def yonetim_paneli(db: Session = Depends(get_db)):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>PhishAware - Kurumsal Güvenlik Yönetim & Denetim Portalı</title>
+        <link rel="icon" type="image/svg+xml" href="/favicon.ico">
+
         <style>
             :root {{
                 --bg: #0b0f19;
@@ -1155,7 +1671,7 @@ def yonetim_paneli(db: Session = Depends(get_db)):
             .header-actions {{
                 display: flex;
                 align-items: center;
-                gap: 10px;
+                gap: 8px;
                 flex-wrap: wrap;
                 margin-left: auto;
                 justify-content: flex-end;
@@ -1164,10 +1680,10 @@ def yonetim_paneli(db: Session = Depends(get_db)):
             .btn-head {{
                 display: inline-flex;
                 align-items: center;
-                gap: 7px;
-                padding: 8px 15px;
-                border-radius: var(--radius-btn);
-                font-size: 13px;
+                gap: 5px;
+                padding: 6px 12px;
+                border-radius: 6px;
+                font-size: 11.5px;
                 font-weight: 600;
                 cursor: pointer;
                 text-decoration: none;
@@ -1379,18 +1895,37 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                             <span class="header-tag">Kurumsal Güvenlik Portalı</span>
                         </div>
                         <p class="header-subtitle">
-                            Kurum: <strong>{varsayilan_sirket_adi}</strong> &bull; Çok Kanallı Oltalama Tatbikatı &bull; Departman Risk Analitiği
+                            Kurum: <strong>{varsayilan_sirket_adi}</strong> &bull; Çok Kanallı Oltalama Tatbikatı &bull; Risk Analitiği
                         </p>
                     </div>
                 </div>
                 <div class="header-actions">
+                    <div style="position:relative; display:inline-block;">
+                        <button id="btnCanliTestDropdown" onclick="toggleTestMenu(event)" class="btn-head btn-head-sec" style="border-color:rgba(56,189,248,0.45); color:#38bdf8; display:inline-flex; align-items:center; gap:5px; cursor:pointer;" title="Canlı test kanalını seçin">
+                            <span>🎯</span> <span>Canlı Test</span> <span style="font-size:9px; opacity:0.8;">▼</span>
+                        </button>
+                        <div id="testKanalDropdown" style="display:none; position:absolute; right:0; top:calc(100% + 6px); background:#0c1322; border:1px solid rgba(56,189,248,0.3); border-radius:8px; box-shadow:0 15px 35px rgba(0,0,0,0.7); padding:6px; min-width:180px; z-index:9999;">
+                            <button onclick="canliMailModalAc('cmbarmert@gmail.com'); toggleTestMenu();" style="width:100%; display:flex; align-items:center; gap:8px; padding:7px 10px; background:none; border:none; color:#f8fafc; font-size:11.5px; border-radius:5px; cursor:pointer; text-align:left; transition:background 0.15s;" onmouseover="this.style.background='rgba(56,189,248,0.15)'" onmouseout="this.style.background='none'">
+                                <span>📧</span> Canlı E-Posta Testi
+                            </button>
+                            <button onclick="canliTelegramModalAc(); toggleTestMenu();" style="width:100%; display:flex; align-items:center; gap:8px; padding:7px 10px; background:none; border:none; color:#f8fafc; font-size:11.5px; border-radius:5px; cursor:pointer; text-align:left; transition:background 0.15s;" onmouseover="this.style.background='rgba(2,132,199,0.15)'" onmouseout="this.style.background='none'">
+                                <span>✈️</span> Canlı Telegram Testi
+                            </button>
+                        </div>
+                    </div>
+                    <button onclick="agAyarlariModalAc()" class="btn-head btn-head-sec" style="border-color:rgba(56,189,248,0.45); color:#38bdf8; display:inline-flex; align-items:center; gap:5px;" title="Mobil ve Dış Ağ Erişim Adresini (Base URL) Gör / Düzenle">
+                        <span>🌐</span> <span id="headerBaseUrlDisplay">{base_url}</span>
+                    </button>
+                    <a href="/oyun-simulasyonu" target="_blank" class="btn-head btn-head-sec" style="border-color:rgba(16,185,129,0.45); color:#34d399; text-decoration:none;" title="3D Sanal Ofis Tehdit Avı Mini Oyununu Başlat">
+                        <span>🎮</span> <span>3D Ofis</span>
+                    </a>
                     <a href="/rapor/csv/{varsayilan_sirket_id}" class="btn-head btn-head-pri" title="Excel uyumlu UTF-8 BOM CSV Denetim Raporu İndir">
-                        {ICON_DOWNLOAD} <span>CSV Denetim Raporu</span>
+                        {ICON_DOWNLOAD} <span>CSV Rapor</span>
                     </a>
                     <button onclick="window.print()" class="btn-head btn-head-sec" title="Yönetim Kurulu için A4 Formatında Yazdır / PDF Kaydet">
-                        {ICON_PRINTER} <span>Raporu Yazdır (PDF)</span>
+                        {ICON_PRINTER} <span>Yazdır (PDF)</span>
                     </button>
-                    <span class="badge-live"><span class="dot"></span> Aktif</span>
+                    <span class="badge-live" style="padding:4px 9px; font-size:11px;"><span class="dot"></span> Aktif</span>
                 </div>
             </div>
 
@@ -1398,7 +1933,7 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                 <div class="stat-card">
                     <div class="stat-title">Hedef Personel</div>
                     <div class="stat-value">{toplam_calisan}</div>
-                    <div class="stat-sub">Kayıtlı Kurumsal Kadro</div>
+                    <div class="stat-sub">{calisan_alt_baslik}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-title">Bağlantıyı Açanlar</div>
@@ -1474,6 +2009,7 @@ def yonetim_paneli(db: Session = Depends(get_db)):
             </div>
 
             <div class="section-card" style="margin-bottom: 24px;">
+
                 <div class="section-header" style="flex-wrap:wrap; gap:10px;">
                     <div class="section-title">
                         {ICON_SEND} <span>Yeni Simülasyon Tatbikatı Başlat (Otonom AI Destekli)</span>
@@ -1518,11 +2054,18 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                         <label>📡 Saldırı Vektörü (İletim Kanalı)</label>
                         <select id="kampanyaKanal">
                             <option value="email" selected>📧 Kurumsal E-Posta (Simüle / Canlı Relay)</option>
-                            <option value="whatsapp">💬 Kurumsal WhatsApp Mesajı (Smishing)</option>
-                            <option value="sms">📱 Kurumsal SMS / Mobil İleti (Smishing)</option>
+                            <option value="telegram">✈️ Kurumsal Telegram Güvenlik Hattı (Doğrudan Canlı)</option>
                             <option value="qr">🔳 Ofis / Pano QR Kod Afişi (Quishing)</option>
                         </select>
                     </div>
+                </div>
+
+                <div id="kampanyaQrSecenekAlani" style="margin-top:14px; background:rgba(2,132,199,0.08); border:1px solid rgba(56,189,248,0.25); border-radius:10px; padding:12px 16px; display:flex; align-items:center; gap:12px;">
+                    <input type="checkbox" id="kampanyaQrIleMi" style="width:18px; height:18px; accent-color:#0284c7; cursor:pointer;" />
+                    <label for="kampanyaQrIleMi" style="margin-bottom:0; font-size:13px; color:#f1f5f9; cursor:pointer; font-weight:600;">
+                        📷 Karekod (QR / Quishing) Entegrasyonu: 
+                        <span style="font-size:12px; color:#94a3b8; font-weight:normal;">Seçilen iletim kanalındaki mesajın içerisine taranabilir kurumsal QR kod görseli ekle.</span>
+                    </label>
                 </div>
 
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-top:20px; padding-top:16px; border-top:1px solid var(--border);">
@@ -1557,67 +2100,67 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                         </thead>
                         <tbody>
     """
-    for log in son_hedefler:
-        if log.supheli_bildirildi_mi:
-            durum_badge = '<span class="badge-status" style="background:rgba(234,179,8,0.15); color:#facc15; border:1px solid rgba(234,179,8,0.3);">Siber Kahraman (İhbar Bildirildi)</span>'
-        elif log.egitim_tamamlandi_mi:
-            durum_badge = '<span class="badge-status status-completed">Eğitim Tamamlandı</span>'
-        elif log.tiklandi_mi:
-            durum_badge = '<span class="badge-status status-caught">Bağlantı Açıldı</span>'
-        else:
-            durum_badge = '<span class="badge-status status-safe">İletildi (Bekliyor)</span>'
+    if son_hedefler:
+        hedef_listesi = tekil_hedefler if 'tekil_hedefler' in locals() else son_hedefler
+        for log in hedef_listesi:
+            if log.supheli_bildirildi_mi:
+                durum_badge = '<span class="badge-status" style="background:rgba(234,179,8,0.15); color:#facc15; border:1px solid rgba(234,179,8,0.3);">Siber Kahraman (İhbar Bildirildi)</span>'
+            elif log.egitim_tamamlandi_mi:
+                durum_badge = '<span class="badge-status status-completed">Eğitim Tamamlandı</span>'
+            elif log.tiklandi_mi:
+                durum_badge = '<span class="badge-status status-caught">Bağlantı Açıldı</span>'
+            else:
+                durum_badge = '<span class="badge-status status-safe">İletildi (Bekliyor)</span>'
 
-        hedef_kanal = getattr(log.kampanya.sablon, "kanal", "email") if (log.kampanya and log.kampanya.sablon) else "email"
-        kanal_badge = {
-            "email": '<span style="color:#38bdf8; font-weight:600;">E-Posta</span>',
-            "whatsapp": '<span style="color:#22c55e; font-weight:600;">WhatsApp</span>',
-            "sms": '<span style="color:#fbbf24; font-weight:600;">SMS</span>',
-            "qr": '<span style="color:#c084fc; font-weight:600;">QR Kod</span>'
-        }.get(hedef_kanal, '<span style="color:#38bdf8;">E-Posta</span>')
+            sablon_obj = log.kampanya.sablon if (log.kampanya and hasattr(log.kampanya, "sablon")) else None
+            hedef_kanal = getattr(sablon_obj, "kanal", "email") if sablon_obj else "email"
+            kanal_badge = {
+                "email": '<span style="color:#38bdf8; font-weight:600;">E-Posta</span>',
+                "telegram": '<span style="color:#0284c7; font-weight:600;">Telegram</span>',
+                "qr": '<span style="color:#c084fc; font-weight:600;">QR Kod</span>'
+            }.get(hedef_kanal, '<span style="color:#38bdf8;">E-Posta</span>')
 
-        hedef_senaryo = log.senaryo_adi or (log.kampanya.sablon.baslik if (log.kampanya and log.kampanya.sablon) else "Genel Oltalama")
+            hedef_senaryo = log.senaryo_adi or (sablon_obj.baslik if (sablon_obj and sablon_obj.baslik) else "Genel Oltalama")
 
-        test_url = f"/tikla/{log.takip_kodu}"
-        lan_url = f"http://{lan_ip}:8000/tikla/{log.takip_kodu}"
-        calisan_adi_temiz = log.calisan.ad_soyad.replace("'", "\\'")
+            test_url = f"/tikla/{log.takip_kodu}"
+            calisan = log.calisan
+            calisan_ad = calisan.ad_soyad if calisan else "İsimsiz Personel"
+            calisan_email = calisan.email if calisan else "-"
+            calisan_dep = (calisan.departman if calisan and calisan.departman else "Genel")
+            calisan_risk = calisan.risk_puani if calisan else 0
+            calisan_tg = (calisan.telegram_id or "") if calisan else ""
+            calisan_id = calisan.id if calisan else 0
 
-        if hedef_kanal == "whatsapp":
+            calisan_adi_temiz = calisan_ad.replace("'", "\\'")
+            calisan_tg_id = calisan_tg.replace("'", "\\'").strip()
+
             aksiyonlar = f"""
-                <div style="display:flex; gap:6px; align-items:center;">
-                    <a href="{test_url}" target="_blank" class="btn-link" title="Web sekmesinde doğrudan aç">🔗 Aç ↗</a>
-                    <button onclick="whatsappTestAc('{calisan_adi_temiz}', '{lan_url}')" class="btn-link" style="background:rgba(34,197,94,0.18); color:#22c55e; border-color:rgba(34,197,94,0.35); cursor:pointer;">💬 WhatsApp Gönder</button>
-                </div>
-            """
-        elif hedef_kanal == "sms":
-            aksiyonlar = f"""
-                <div style="display:flex; gap:6px; align-items:center;">
-                    <a href="{test_url}" target="_blank" class="btn-link" title="Web sekmesinde doğrudan aç">🔗 Aç ↗</a>
-                    <button onclick="smsTestAc('{calisan_adi_temiz}', '{lan_url}')" class="btn-link" style="background:rgba(245,158,11,0.18); color:#f59e0b; border-color:rgba(245,158,11,0.35); cursor:pointer;">📱 SMS Testi</button>
-                </div>
-            """
-        elif hedef_kanal == "qr":
-            aksiyonlar = f"""
-                <div style="display:flex; gap:6px; align-items:center;">
-                    <a href="{test_url}" target="_blank" class="btn-link" title="Web sekmesinde doğrudan aç">🔗 Aç ↗</a>
-                    <a href="/afis/{log.takip_kodu}" target="_blank" class="btn-link" style="background:rgba(192,132,252,0.18); color:#c084fc; border-color:rgba(192,132,252,0.35);">🔳 Afiş / QR Tara ↗</a>
-                </div>
-            """
-        else:
-            aksiyonlar = f"""
-                <div style="display:flex; gap:6px; align-items:center;">
-                    <a href="{test_url}" target="_blank" class="btn-link">📧 Simüle E-Posta Aç ↗</a>
+                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                    <a href="{test_url}" target="_blank" class="btn-link" title="Simüle Linki Doğrudan Tarayıcıda Aç">🔗 Aç ↗</a>
+                    <button onclick="canliMailModalAc('{calisan_email}')" class="btn-link" style="background:rgba(56,189,248,0.18); color:#38bdf8; border-color:rgba(56,189,248,0.35); cursor:pointer;" title="Bu personele canlı e-posta gönder">📧 E-Posta</button>
+                    <button onclick="canliTelegramModalAc('{calisan_adi_temiz}', '{calisan_tg_id}', '{calisan_id}')" class="btn-link" style="background:rgba(2,132,199,0.18); color:#38bdf8; border-color:rgba(2,132,199,0.35); cursor:pointer;" title="Bu personele Kurumsal Telegram Güvenlik Hattı ile canlı mesaj gönder">✈️ Telegram</button>
+                    <a href="/afis/{log.takip_kodu}" target="_blank" class="btn-link" style="background:rgba(192,132,252,0.18); color:#c084fc; border-color:rgba(192,132,252,0.35);" title="Fiziksel Afiş ve Karekod Göster">🔳 QR Afiş</a>
                 </div>
             """
 
-        html += f"""
+            html += f"""
+                                <tr>
+                                    <td><strong>{calisan_ad}</strong></td>
+                                    <td style="color:var(--muted);">{calisan_dep}</td>
+                                    <td><span style="font-size:12px; color:var(--text); background:var(--surface); border:1px solid var(--border); padding:3px 8px; border-radius:4px; font-weight:500;">✨ {hedef_senaryo}</span></td>
+                                    <td>{kanal_badge}</td>
+                                    <td><span style="color:#f59e0b; font-weight:700;">{calisan_risk} Puan</span></td>
+                                    <td>{durum_badge}</td>
+                                    <td>{aksiyonlar}</td>
+                                </tr>
+            """
+    else:
+        html += """
                             <tr>
-                                <td><strong>{log.calisan.ad_soyad}</strong></td>
-                                <td style="color:var(--muted);">{log.calisan.departman}</td>
-                                <td><span style="font-size:12px; color:var(--text); background:var(--surface); border:1px solid var(--border); padding:3px 8px; border-radius:4px; font-weight:500;">✨ {hedef_senaryo}</span></td>
-                                <td>{kanal_badge}</td>
-                                <td><span style="color:#f59e0b; font-weight:700;">{log.calisan.risk_puani} Puan</span></td>
-                                <td>{durum_badge}</td>
-                                <td>{aksiyonlar}</td>
+                                <td colspan="7" style="text-align:center; padding:32px; color:var(--muted); font-size:13.5px;">
+                                    🛡️ Henüz aktif bir tatbikat bulunmuyor veya istatistikler sıfırlandı.<br>
+                                    <span style="font-size:12px; opacity:0.8;">Yukarıdaki panelden hedef departman ve iletim kanalını seçip <strong>"Tatbikatı Başlat & Otonom Dağıt"</strong> butonuna basarak yeni bir oltalama simülasyonu başlatabilirsiniz.</span>
+                                </td>
                             </tr>
         """
     html += """
@@ -1628,6 +2171,9 @@ def yonetim_paneli(db: Session = Depends(get_db)):
         </div>
 
         <script>
+
+
+
             function setTheme(name) {
                 document.body.className = 'theme-' + name;
                 localStorage.setItem('phishaware_theme', name);
@@ -1648,6 +2194,7 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                 const sirketId = parseInt(document.getElementById('kampanyaSirket').value);
                 const hedefDep = document.getElementById('hedefDepartman').value;
                 const kanal = document.getElementById('kampanyaKanal').value;
+                const qrIleMi = document.getElementById('kampanyaQrIleMi') ? document.getElementById('kampanyaQrIleMi').checked : false;
                 const btn = document.getElementById('btnKampanya');
                 const sonucDiv = document.getElementById('kampanyaSonuc');
 
@@ -1672,7 +2219,8 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                         sirket_id: sirketId, 
                         hedef_departman: hedefDep, 
                         kanal: kanal, 
-                        otomatik_ai: true 
+                        otomatik_ai: true,
+                        qr_ile_mi: qrIleMi
                     })
                 })
                 .then(r => {
@@ -1707,36 +2255,69 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                 });
             }
 
-            let currentWaText = '';
-            let currentSmsText = '';
-
-            function whatsappTestAc(calisanAdi, link) {
-                currentWaText = 'TrendLojistik A.Ş. Kurumsal Onay Masası\\n\\nSayın ' + calisanAdi + ', şirketiniz adına bekleyen acil onay talebiniz bulunmaktadır. İncelemek ve onaylamak için lütfen bağlantıya tıklayınız:\\n' + link;
-                document.getElementById('waPreviewText').innerText = currentWaText;
-                document.getElementById('modalWhatsApp').style.display = 'flex';
+            function toggleTestMenu(event) {
+                if (event) event.stopPropagation();
+                const dd = document.getElementById('testKanalDropdown');
+                if (!dd) return;
+                dd.style.display = (dd.style.display === 'none' || !dd.style.display) ? 'block' : 'none';
             }
 
-            function waMesajGonder() {
-                let phone = document.getElementById('waPhoneInput').value.replace(/[^0-9]/g, '');
-                let text = encodeURIComponent(currentWaText);
-                let url = phone ? 'https://wa.me/' + phone + '?text=' + text : 'https://wa.me/?text=' + text;
-                window.open(url, '_blank');
+            document.addEventListener('click', function(e) {
+                const dd = document.getElementById('testKanalDropdown');
+                const btn = document.getElementById('btnCanliTestDropdown');
+                if (dd && btn && !btn.contains(e.target) && !dd.contains(e.target)) {
+                    dd.style.display = 'none';
+                }
+            });
+
+            function agAyarlariModalAc() {
+                const modal = document.getElementById('modalAgAyarlari');
+                if (modal) modal.style.display = 'flex';
             }
 
-            function smsTestAc(calisanAdi, link) {
-                currentSmsText = 'Sayin ' + calisanAdi + ', kurumsal hesabiniza erisim talebi tespit edildi. Onaylamiyorsaniz derhal iptal edin: ' + link;
-                document.getElementById('smsPreviewBody').innerText = currentSmsText;
-                document.getElementById('modalSMS').style.display = 'flex';
+            function agAyarlariModalKapat() {
+                const modal = document.getElementById('modalAgAyarlari');
+                if (modal) modal.style.display = 'none';
             }
 
-            function telefondaSmsAc() {
-                window.open('sms:?body=' + encodeURIComponent(currentSmsText), '_blank');
+            function tunelPenceresiAc() {
+                fetch('/api/ayarlar/tunel-penceresi-ac', { method: 'POST' })
+                .then(r => r.json())
+                .then(res => {
+                    alert('🚀 ' + res.mesaj);
+                }).catch(err => {
+                    alert('Hata: ' + err);
+                });
             }
 
-            function smsMetniKopyala() {
-                navigator.clipboard.writeText(currentSmsText);
-                document.getElementById('smsKopyalandi').style.display = 'block';
-                setTimeout(() => { document.getElementById('smsKopyalandi').style.display = 'none'; }, 2000);
+            function kaydetBaseUrl() {
+                const val = document.getElementById('inputNewBaseUrl').value.trim();
+                fetch('/api/ayarlar/base-url', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ base_url: val })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    alert('✅ ' + data.mesaj);
+                    const headEl = document.getElementById('headerBaseUrlDisplay');
+                    if (headEl) headEl.innerText = data.guncel_base_url;
+                    const currEl = document.getElementById('currBaseUrlText');
+                    if (currEl) currEl.innerText = data.guncel_base_url;
+                    agAyarlariModalKapat();
+                })
+                .catch(err => {
+                    alert('❌ Hata oluştu: ' + err);
+                });
+            }
+
+            function canliMailModalAc(email) {
+                if (email) {
+                    const inputEl = document.getElementById('testAliciEmail');
+                    if (inputEl) inputEl.value = email;
+                }
+                const modal = document.getElementById('modalEpostaTest');
+                if (modal) modal.style.display = 'flex';
             }
 
             function terminalLogYaz(metin, renk='#34d399') {
@@ -1787,6 +2368,57 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                         document.getElementById('terminalSpinner').innerHTML = '<span style="color:#10b981;">✔ DAĞITIM TAMAMLANDI</span>';
                         document.getElementById('terminalStatusText').innerText = 'Tüm çalışanlara hedefe özel habersiz simülasyon paketleri iletildi.';
                         document.getElementById('btnTerminalKapat').style.display = 'block';
+
+                        // Canlı Hedefler & Toplu Canlı İletim
+                        const kanal = rapor.kanal || 'email';
+                        const qrIleMi = Boolean(rapor.qr_ile_mi);
+                        if (kanal === 'telegram') {
+                            const qrBilgi = qrIleMi ? ' (📷 Karekod Fotoğraflı)' : '';
+                            terminalLogYaz('--------------------------------------------------------------------------------', '#38bdf8');
+                            terminalLogYaz('<span style="color:#0284c7; font-weight:bold;">✈️ [OTONOM TOPLU TELEGRAM DAĞITIMI' + qrBilgi + ']</span> Kayıtlı tüm çalışanlara kendi isim ve unvanlarıyla kişiselleştirilmiş bildirimler iletiliyor...');
+                            fetch('/simulasyon/toplu-telegram-gonder' + (qrIleMi ? '?qr_ile_mi=true' : ''), { method: 'POST' })
+                            .then(r => r.json())
+                            .then(res => {
+                                if (res.durum === 'tamamlandi' && res.sonuclar) {
+                                    terminalLogYaz('<span style="color:#10b981; font-weight:bold;">✔ [TOPLU DAĞITIM RAPORU]</span> Toplam ' + res.toplam_hedef + ' çalışan için kişiselleştirilmiş iletim tamamlandı:');
+                                    res.sonuclar.forEach(s => {
+                                        if (s.durum === 'basarili') {
+                                            terminalLogYaz('  ➔ <span style="color:#10b981; font-weight:bold;">✔ ' + s.calisan_adi + ' (' + s.telegram_id + '):</span> Başarıyla iletildi');
+                                        } else {
+                                            terminalLogYaz('  ➔ <span style="color:#f87171; font-weight:bold;">⚠️ ' + s.calisan_adi + ' (' + s.telegram_id + '):</span> ' + s.mesaj);
+                                        }
+                                    });
+                                } else {
+                                    terminalLogYaz('<span style="color:#f87171;">⚠️ [TELEGRAM BİLDİRİM]</span> ' + (res.mesaj || 'İletim kuyruğuna alındı.'));
+                                }
+                            }).catch(err => {
+                                terminalLogYaz('<span style="color:#f87171;">❌ [TELEGRAM BAĞLANTI HATASI]</span> ' + err.message);
+                            });
+                        } else if (kanal === 'qr') {
+                            const mertLog = loglar.find(l => (l.calisan_adi && l.calisan_adi.includes('Mert')) || (l.hedef_adresi && (l.hedef_adresi.includes('551') || l.hedef_adresi.includes('cmbarmert'))));
+                            if (mertLog) {
+                                terminalLogYaz('--------------------------------------------------------------------------------', '#38bdf8');
+                                terminalLogYaz('<span style="color:#c084fc; font-weight:bold;">🔳 [OFİS QR AFİŞİ]</span> Mert Çinbar için fiziksel afiş hazır: <a href="/afis/' + mertLog.takip_kodu + '" target="_blank" style="color:#c084fc; text-decoration:underline; font-weight:bold;">👉 Afişi Gör / Yazdır (/afis/' + mertLog.takip_kodu + ')</a>');
+                            }
+                        } else {
+                            const mertLog = loglar.find(l => (l.calisan_adi && l.calisan_adi.includes('Mert')) || (l.hedef_adresi && (l.hedef_adresi.includes('551') || l.hedef_adresi.includes('cmbarmert'))));
+                            if (mertLog) {
+                                terminalLogYaz('--------------------------------------------------------------------------------', '#38bdf8');
+                                const qrBilgi = qrIleMi ? ' (📷 Karekod Kartlı)' : '';
+                                terminalLogYaz('<span style="color:#38bdf8; font-weight:bold;">📧 [E-POSTA SALDIRISI' + qrBilgi + ']</span> Mert Çinbar için oltalama takip linki: <a href="' + mertLog.takip_linki + '" target="_blank" style="color:#38bdf8; text-decoration:underline; font-weight:bold;">👉 ' + mertLog.takip_linki + '</a>');
+                                let mailUrl = '/simulasyon/canli-mail-testi?alici_email=cmbarmert@gmail.com&sablon_id=' + (data.sablon_id || 1);
+                                if (qrIleMi) mailUrl += '&qr_ile_mi=true';
+                                fetch(mailUrl, { method: 'POST' })
+                                .then(r => r.json())
+                                .then(res => {
+                                    if (res.durum === 'basarili') {
+                                        terminalLogYaz('<span style="color:#10b981; font-weight:bold;">✔ [E-POSTA İLETİLDİ]</span> cmbarmert@gmail.com gelen kutunuza gerçek mail teslim edildi!');
+                                    } else {
+                                        terminalLogYaz('<span style="color:#94a3b8;">ℹ️ [E-POSTA SİMÜLE]</span> ' + (res.mesaj || 'Simülasyon kuyruğuna alındı.') + ' (Link: ' + mertLog.takip_linki + ')');
+                                    }
+                                }).catch(() => {});
+                            }
+                        }
                     }
                 }
                 setTimeout(sonrakiHedef, 200);
@@ -1845,6 +2477,8 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                 btn.disabled = true;
 
                 let url = '/simulasyon/canli-mail-testi?alici_email=' + encodeURIComponent(email) + '&sablon_id=' + sablonId;
+                const qrIleMi = document.getElementById('testMailQrIleMi') ? document.getElementById('testMailQrIleMi').checked : false;
+                if (qrIleMi) url += '&qr_ile_mi=true';
                 const hst = document.getElementById('smtpHst') ? document.getElementById('smtpHst').value.trim() : '';
                 const prt = document.getElementById('smtpPrt') ? document.getElementById('smtpPrt').value.trim() : '';
                 const usr = document.getElementById('smtpUsr') ? document.getElementById('smtpUsr').value.trim() : '';
@@ -1902,67 +2536,90 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                     sonucDiv.innerHTML = '❌ <strong>Hata:</strong> ' + err.message;
                 });
             }
+
+            function canliTelegramModalAc(calisanAdi, tgId, calisanId) {
+                const modal = document.getElementById('modalTelegramTest');
+                if (!modal) return;
+                const input = document.getElementById('tgChatId');
+                if (input && tgId !== undefined && tgId !== '') {
+                    input.value = tgId;
+                }
+                const calisanIdInput = document.getElementById('tgCalisanId');
+                if (calisanIdInput) {
+                    calisanIdInput.value = calisanId || '';
+                }
+                const modalBaslik = document.getElementById('tgModalBaslik');
+                if (modalBaslik) {
+                    modalBaslik.innerText = calisanAdi ? ('Canlı Telegram Testi (' + calisanAdi + ')') : 'Canlı Kurumsal Telegram Testi';
+                }
+                const sonucDiv = document.getElementById('testTgSonuc');
+                if (sonucDiv) sonucDiv.style.display = 'none';
+                modal.style.display = 'flex';
+            }
+
+            function canliTelegramTestiGonder() {
+                const token = document.getElementById('tgBotToken') ? document.getElementById('tgBotToken').value.trim() : '';
+                const chatId = document.getElementById('tgChatId') ? document.getElementById('tgChatId').value.trim() : '';
+                const calisanId = document.getElementById('tgCalisanId') ? document.getElementById('tgCalisanId').value.trim() : '';
+                const kaydet = document.getElementById('tgKaydetEnv') ? document.getElementById('tgKaydetEnv').checked : false;
+                const qrIleMi = document.getElementById('testTgQrIleMi') ? document.getElementById('testTgQrIleMi').checked : false;
+                const btn = document.getElementById('btnTgTestGonder');
+                const sonucDiv = document.getElementById('testTgSonuc');
+
+                btn.innerHTML = '⏳ Gönderiliyor...';
+                btn.style.opacity = '0.7';
+                btn.disabled = true;
+
+                let url = '/simulasyon/canli-telegram-testi';
+                const params = [];
+                if (chatId) params.push('chat_id=' + encodeURIComponent(chatId));
+                if (token) params.push('bot_token=' + encodeURIComponent(token));
+                if (calisanId) params.push('calisan_id=' + encodeURIComponent(calisanId));
+                if (kaydet) params.push('kaydet=true');
+                if (qrIleMi) params.push('qr_ile_mi=true');
+                if (params.length > 0) url += '?' + params.join('&');
+
+                fetch(url, { method: 'POST' })
+                .then(async r => {
+                    const data = await r.json();
+                    if (!r.ok) throw new Error(data.detail || 'Gönderim başarısız');
+                    return data;
+                })
+                .then(res => {
+                    btn.innerHTML = '🚀 Canlı Telegram Bildirimi Gönder';
+                    btn.style.opacity = '1';
+                    btn.disabled = false;
+                    sonucDiv.style.display = 'block';
+                    if (res.durum === 'basarili') {
+                        sonucDiv.style.color = '#10b981';
+                        sonucDiv.style.background = 'rgba(16,185,129,0.12)';
+                        sonucDiv.style.border = '1px solid rgba(16,185,129,0.3)';
+                        sonucDiv.innerHTML = '✔️ <strong>Başarılı (Canlı Teslimat):</strong> ' + res.mesaj;
+                    } else if (res.durum === 'simule') {
+                        sonucDiv.style.color = '#38bdf8';
+                        sonucDiv.style.background = 'rgba(6,182,212,0.12)';
+                        sonucDiv.style.border = '1px solid rgba(6,182,212,0.3)';
+                        sonucDiv.innerHTML = 'ℹ️ <strong>Simüle İletim:</strong> ' + res.mesaj + 
+                            '<br><br><span style="color:#94a3b8;">Doğrudan telefonunuza bildirim düşmesi için yukarıdaki kutulara Telegram Bot Token ve Chat ID bilgilerinizi giriniz.</span>';
+                    } else {
+                        sonucDiv.style.color = '#f87171';
+                        sonucDiv.style.background = 'rgba(239,68,68,0.12)';
+                        sonucDiv.style.border = '1px solid rgba(239,68,68,0.3)';
+                        sonucDiv.innerHTML = '⚠️ <strong>Hata / Uyarı:</strong> ' + res.mesaj;
+                    }
+                })
+                .catch(err => {
+                    btn.innerHTML = '🚀 Canlı Telegram Bildirimi Gönder';
+                    btn.style.opacity = '1';
+                    btn.disabled = false;
+                    sonucDiv.style.display = 'block';
+                    sonucDiv.style.color = '#f87171';
+                    sonucDiv.style.background = 'rgba(239,68,68,0.12)';
+                    sonucDiv.style.border = '1px solid rgba(239,68,68,0.3)';
+                    sonucDiv.innerHTML = '❌ <strong>Hata:</strong> ' + err.message;
+                });
+            }
         </script>
-
-        <div id="modalWhatsApp" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); backdrop-filter:blur(8px); z-index:9999; align-items:center; justify-content:center;">
-            <div style="background:#121b2d; border:1px solid rgba(34,197,94,0.4); border-radius:18px; max-width:520px; width:92%; padding:26px; box-shadow:0 25px 60px rgba(0,0,0,0.8);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-                    <div style="display:flex; align-items:center; gap:10px;">
-                        <span style="font-size:24px;">💬</span>
-                        <h3 style="font-size:17px; font-weight:700; color:#fff;">Canlı WhatsApp Test Gönderimi</h3>
-                    </div>
-                    <button onclick="document.getElementById('modalWhatsApp').style.display='none'" style="background:none; border:none; color:var(--muted); font-size:22px; cursor:pointer;">✕</button>
-                </div>
-                <p style="font-size:13px; color:var(--muted); line-height:1.5; margin-bottom:14px;">
-                    Resmi WhatsApp Web / Mobil protokolüyle doğrudan kendi telefonunuza veya hedef numaraya gerçek bir simülasyon mesajı yollayabilirsiniz.
-                </p>
-                <div style="background:#090d16; border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:16px; font-size:13px;">
-                    <div style="color:#22c55e; font-weight:700; margin-bottom:6px;">WhatsApp Mesaj Önizlemesi:</div>
-                    <div id="waPreviewText" style="color:#e2e8f0; line-height:1.5; white-space:pre-wrap;"></div>
-                </div>
-                <div class="form-group" style="margin-bottom:16px;">
-                    <label>Hedef Telefon Numarası (Örn: 905xxxxxxxxx)</label>
-                    <input type="text" id="waPhoneInput" placeholder="905xxxxxxxxx (Boş bırakırsanız WhatsApp'ta kişi seçebilirsiniz)" />
-                    <div style="font-size:11px; color:#94a3b8; margin-top:4px;">* Kendi numaranızı yazıp doğrudan kendinize test mesajı yollayabilirsiniz!</div>
-                </div>
-                <div style="display:flex; gap:10px;">
-                    <button onclick="document.getElementById('modalWhatsApp').style.display='none'" style="flex:1; background:rgba(255,255,255,0.08); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:600;">İptal</button>
-                    <button onclick="waMesajGonder()" style="flex:2; background:linear-gradient(135deg, #16a34a 0%, #22c55e 100%); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:700; display:flex; align-items:center; justify-content:center; gap:8px;">
-                        <span>🚀</span> WhatsApp'ta Aç & Gönder
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <div id="modalSMS" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); backdrop-filter:blur(8px); z-index:9999; align-items:center; justify-content:center;">
-            <div style="background:#121b2d; border:1px solid rgba(245,158,11,0.4); border-radius:18px; max-width:480px; width:92%; padding:26px; box-shadow:0 25px 60px rgba(0,0,0,0.8);">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-                    <div style="display:flex; align-items:center; gap:10px;">
-                        <span style="font-size:24px;">📱</span>
-                        <h3 style="font-size:17px; font-weight:700; color:#fff;">SMS (Smishing) Test Simülatörü</h3>
-                    </div>
-                    <button onclick="document.getElementById('modalSMS').style.display='none'" style="background:none; border:none; color:var(--muted); font-size:22px; cursor:pointer;">✕</button>
-                </div>
-
-                <div style="background:#090d16; border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:16px; margin-bottom:18px; box-shadow:0 8px 25px rgba(0,0,0,0.5);">
-                    <div style="display:flex; justify-content:space-between; font-size:11px; color:#94a3b8; margin-bottom:8px;">
-                        <span>💬 MESAJLAR • B002-TRENDLOJISTIK</span>
-                        <span>Şimdi</span>
-                    </div>
-                    <div id="smsPreviewBody" style="font-size:13px; color:#f8fafc; line-height:1.5;"></div>
-                </div>
-
-                <div style="display:flex; gap:10px;">
-                    <button onclick="telefondaSmsAc()" style="flex:2; background:linear-gradient(135deg, #d97706 0%, #f59e0b 100%); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:700;">
-                        📲 Telefonda SMS Aç (sms:)
-                    </button>
-                    <button onclick="smsMetniKopyala()" style="flex:1; background:rgba(255,255,255,0.08); color:#fff; border:1px solid rgba(255,255,255,0.15); padding:12px; border-radius:10px; cursor:pointer; font-weight:600;">
-                        📋 Kopyala
-                    </button>
-                </div>
-                <div id="smsKopyalandi" style="display:none; color:#10b981; font-size:12px; margin-top:10px; text-align:center;">✔️ SMS metni panoya kopyalandı!</div>
-            </div>
-        </div>
 
         <div id="modalTerminal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.85); backdrop-filter:blur(10px); z-index:10000; align-items:center; justify-content:center;">
             <div style="background:#050811; border:1px solid #10b981; border-radius:18px; max-width:720px; width:94%; padding:26px; box-shadow:0 0 50px rgba(16,185,129,0.25); font-family:Consolas, Monaco, monospace;">
@@ -1980,6 +2637,50 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                     <button id="btnTerminalKapat" onclick="terminaliKapatVeYenile()" style="display:none; background:#10b981; color:#000; border:none; padding:10px 20px; border-radius:8px; font-weight:700; cursor:pointer;">
                         📊 Canlı Takip Masasına Git ↗
                     </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Ağ & Mobil Erişim Ayarları Modalı -->
+        <div id="modalAgAyarlari" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); backdrop-filter:blur(8px); z-index:9999; align-items:center; justify-content:center;">
+            <div style="background:#121b2d; border:1.5px solid rgba(56,189,248,0.45); border-radius:20px; max-width:560px; width:92%; max-height:90vh; overflow-y:auto; padding:26px; box-shadow:0 30px 70px rgba(0,0,0,0.9);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span style="font-size:24px;">🌐</span>
+                        <h3 style="font-size:18px; font-weight:700; color:#fff;">Mobil ve Dış Ağ Erişim Ayarları</h3>
+                    </div>
+                    <button onclick="agAyarlariModalKapat()" style="background:none; border:none; color:var(--muted); font-size:22px; cursor:pointer;">✕</button>
+                </div>
+                <p style="font-size:13px; color:#cbd5e1; line-height:1.6; margin-bottom:16px;">
+                    Telefondan e-posta veya Telegram linklerine tıklandığında açılması için sistemin bağlantı adresi (Base URL) aşağıda tanımlıdır:
+                </p>
+                <div style="background:#060911; border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:14px; margin-bottom:16px;">
+                    <div style="font-size:11px; color:#94a3b8; margin-bottom:4px; font-weight:600;">Mevcut Aktif Erişim Adresi:</div>
+                    <div style="font-size:14.5px; font-weight:800; color:#38bdf8; font-family:monospace; word-break:break-all;" id="currBaseUrlText">{base_url}</div>
+                </div>
+
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="font-size:12.5px; font-weight:700; color:#f8fafc; margin-bottom:6px; display:block;">Yeni Erişim Adresi (Base URL):</label>
+                    <input type="text" id="inputNewBaseUrl" class="form-control" placeholder="https://xxxx.pinggy.link veya http://192.168.1.50:8000" value="{base_url}" style="width:100%; background:#090d16; border:1px solid rgba(255,255,255,0.15); border-radius:10px; padding:12px; color:#fff; font-size:13.5px; font-family:monospace;" />
+                </div>
+                <div style="display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap;">
+                    <button type="button" onclick="document.getElementById('inputNewBaseUrl').value = 'http://{lan_ip}:8000'" class="btn-head btn-head-sec" style="font-size:11.5px; padding:6px 12px; border-color:rgba(56,189,248,0.4); color:#38bdf8; cursor:pointer;" title="Aynı Wi-Fi ağındaki telefonların doğrudan açabilmesi için">
+                        📡 Yerel Wi-Fi IP'sini Yaz (http://{lan_ip}:8000)
+                    </button>
+                    <button type="button" onclick="tunelPenceresiAc()" class="btn-head btn-head-sec" style="font-size:11.5px; padding:6px 12px; border-color:rgba(16,185,129,0.4); color:#10b981; cursor:pointer;" title="Mobil veri (4G/5G) ve dış ağlar için tek tıkla ücretsiz genel HTTPS tüneli açar">
+                        🚀 1-Tıkla Tünel Penceresini Aç (.bat)
+                    </button>
+                </div>
+
+                <div style="background:rgba(56,189,248,0.08); border:1px solid rgba(56,189,248,0.25); border-radius:12px; padding:14px; font-size:12px; color:#93c5fd; line-height:1.6; margin-bottom:20px;">
+                    💡 <strong>Telefonda Neden Açılmaz ve Nasıl Çözülür?</strong><br>
+                    &bull; <strong>Mobil Veri (4G/5G) / Dış Ağ:</strong> Telefondan erişmek için proje klasöründeki <code>mobil_erisim_baslat.bat</code> dosyasını çalıştırın. Windows SSH ile tek tıkla ücretsiz bir genel HTTPS adresi (Pinggy/Localhost.run) alıp yukarıdaki kutucuğa yapıştırın.<br>
+                    &bull; <strong>Kişisel Erişim Noktası (Hotspot):</strong> Bilgisayarı telefonun Wi-Fi paylaşımına bağlayarak tünelsiz yerel IP üzerinden de bağlanabilirsiniz.
+                </div>
+
+                <div style="display:flex; justify-content:flex-end; gap:10px;">
+                    <button onclick="agAyarlariModalKapat()" class="btn-head btn-head-sec">Vazgeç</button>
+                    <button onclick="kaydetBaseUrl()" class="btn-head btn-head-pri">✓ Kaydet ve Uygula</button>
                 </div>
             </div>
         </div>
@@ -2056,6 +2757,13 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                     </div>
                 </div>
 
+                <div style="background:rgba(2,132,199,0.08); border:1px solid rgba(56,189,248,0.25); border-radius:10px; padding:10px 14px; margin-bottom:16px;">
+                    <label style="display:flex; align-items:center; gap:8px; font-size:12px; color:#e2e8f0; cursor:pointer; margin-bottom:0;">
+                        <input type="checkbox" id="testMailQrIleMi" style="accent-color:#0284c7; width:16px; height:16px; cursor:pointer;" />
+                        <span>📷 <strong>Karekod (QR / Quishing) Ekle:</strong> E-posta gövdesine taranabilir kurumsal QR kod kartı yerleştir.</span>
+                    </label>
+                </div>
+
                 <div style="display:flex; gap:10px;">
                     <button onclick="document.getElementById('modalEpostaTest').style.display='none'" style="flex:1; background:rgba(255,255,255,0.08); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:600;">Kapat</button>
                     <button id="btnMailTestGonder" onclick="canliMailTestiGonder()" style="flex:2; background:linear-gradient(135deg, #0284c7 0%, #06b6d4 100%); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:700;">
@@ -2065,6 +2773,66 @@ def yonetim_paneli(db: Session = Depends(get_db)):
                 <div id="testMailSonuc" style="display:none; font-size:12px; margin-top:14px; background:#090d16; padding:12px; border-radius:10px; line-height:1.4;"></div>
             </div>
         </div>
+
+        <div id="modalTelegramTest" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); backdrop-filter:blur(8px); z-index:9999; align-items:center; justify-content:center;">
+            <div style="background:#121b2d; border:1px solid rgba(2,132,199,0.4); border-radius:18px; max-width:540px; width:92%; max-height:90vh; overflow-y:auto; padding:24px; box-shadow:0 25px 60px rgba(0,0,0,0.8);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span style="font-size:24px;">✈️</span>
+                        <h3 id="tgModalBaslik" style="font-size:17px; font-weight:700; color:#fff;">Canlı Kurumsal Telegram Testi</h3>
+                    </div>
+                    <button onclick="document.getElementById('modalTelegramTest').style.display='none'" style="background:none; border:none; color:var(--muted); font-size:22px; cursor:pointer;">✕</button>
+                </div>
+                <input type="hidden" id="tgCalisanId" value="" />
+                <div style="background:rgba(2,132,199,0.12); border:1px solid rgba(56,189,248,0.3); border-radius:10px; padding:10px 14px; margin-bottom:14px; font-size:12px; line-height:1.5;">
+                    🤖 <strong>Resmi Bot Linki:</strong> 
+                    <a href="https://t.me/trend_guvenlik_mert_bot" target="_blank" style="color:#38bdf8; font-weight:700; text-decoration:underline;">
+                        t.me/trend_guvenlik_mert_bot (@trend_guvenlik_mert_bot)
+                    </a>
+                    <div style="color:var(--muted); font-size:11px; margin-top:4px;">
+                        ⚠️ Telegram kuralı: Kişiye ilk mesajın iletilebilmesi için kişinin bu bota en az bir kez <strong>"Başlat" (Start)</strong> demesi gerekir.
+                    </div>
+                </div>
+
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label>Telegram API Token (HTTP API)</label>
+                    <input type="text" id="tgBotToken" placeholder="Örn: 7182938475:AAH..." value="{env_tg_token}" style="font-family:monospace; font-size:12px;" />
+                    <small style="color:var(--muted); font-size:11px; margin-top:4px; display:block;">
+                        💡 Telegram'da <strong style="color:#38bdf8;">@BotFather</strong> ile konuşup <code>/newbot</code> diyerek 10 saniyede ücretsiz alabilirsiniz.
+                    </small>
+                </div>
+
+                <div class="form-group" style="margin-bottom:14px;">
+                    <label>Hedef Chat ID (Kullanıcı / Grup ID)</label>
+                    <input type="text" id="tgChatId" placeholder="Örn: 123456789" value="{env_tg_chat}" style="font-family:monospace; font-size:12px;" />
+                    <small style="color:var(--muted); font-size:11px; margin-top:4px; display:block;">
+                        💡 Kendi ID'nizi öğrenmek için Telegram'da <strong style="color:#38bdf8;">@userinfobot</strong>'a tıklayıp mesaj atabilirsiniz.
+                    </small>
+                </div>
+
+                <div style="margin-bottom:16px;">
+                    <label style="display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); cursor:pointer;">
+                        <input type="checkbox" id="tgKaydetEnv" checked style="accent-color:#0284c7;" />
+                        Bu Telegram bilgilerini .env dosyasına kaydet (Gelecek tatbikatlarda otomatik kullan)
+                    </label>
+                </div>
+
+                <div style="background:rgba(2,132,199,0.08); border:1px solid rgba(56,189,248,0.25); border-radius:10px; padding:10px 14px; margin-bottom:16px;">
+                    <label style="display:flex; align-items:center; gap:8px; font-size:12px; color:#e2e8f0; cursor:pointer; margin-bottom:0;">
+                        <input type="checkbox" id="testTgQrIleMi" style="accent-color:#0284c7; width:16px; height:16px; cursor:pointer;" />
+                        <span>📷 <strong>Karekod (QR / Quishing) Modu:</strong> Metin mesajı yerine taranabilir QR kod fotoğrafı (sendPhoto) gönder.</span>
+                    </label>
+                </div>
+
+                <div style="display:flex; gap:10px;">
+                    <button onclick="document.getElementById('modalTelegramTest').style.display='none'" style="flex:1; background:rgba(255,255,255,0.08); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:600;">Kapat</button>
+                    <button id="btnTgTestGonder" onclick="canliTelegramTestiGonder()" style="flex:2; background:linear-gradient(135deg, #0284c7 0%, #0ea5e9 100%); color:#fff; border:none; padding:12px; border-radius:10px; cursor:pointer; font-weight:700;">
+                        🚀 Canlı Telegram Bildirimi Gönder
+                    </button>
+                </div>
+                <div id="testTgSonuc" style="display:none; font-size:12px; margin-top:14px; background:#090d16; padding:12px; border-radius:10px; line-height:1.4;"></div>
+            </div>
+        </div>
     </body>
     </html>
     """
@@ -2072,6 +2840,8 @@ def yonetim_paneli(db: Session = Depends(get_db)):
     html = html.replace("{env_smtp_host}", env_smtp_host)
     html = html.replace("{env_smtp_port}", env_smtp_port)
     html = html.replace("{env_smtp_user}", env_smtp_user)
+    html = html.replace("{env_tg_token}", env_tg_token)
+    html = html.replace("{env_tg_chat}", env_tg_chat)
     return HTMLResponse(content=html)
 
 
